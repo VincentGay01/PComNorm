@@ -18,10 +18,11 @@
 #include <opencv2/calib3d.hpp>
 std::vector<float> normals;
 bool poseFound = false;
+bool modelbool = false;
 // Variables globales pour la caméra
 float objectRotationX = 0.0f;
 float objectRotationY = 0.0f;
-float cameraDistance = 5.0f; // Distance de la caméra par rapport à l'objet
+float cameraDistance = 1.0f; // Distance de la caméra par rapport à l'objet
 float cameraAngleX = 0.0f;   // Angle de rotation autour de l'axe X
 float cameraAngleY = 0.0f;   // Angle de rotation autour de l'axe Y
 bool isDragging = false;     // Indique si la souris est en train de glisser
@@ -98,8 +99,8 @@ void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
 
 // Callback pour gérer le zoom avec la molette
 void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
-    cameraDistance -= static_cast<float>(yoffset) * 0.25f;
-    if (cameraDistance < 0.25f) cameraDistance = 0.25f; // Limiter le zoom
+    cameraDistance -= static_cast<float>(yoffset) * 0.05f;
+    if (cameraDistance < 0.001f) cameraDistance = 0.001f; // Limiter le zoom
     if (cameraDistance > 20.0f) cameraDistance = 20.0f; // Limiter le dézoom
 }
 
@@ -333,13 +334,12 @@ std::vector<cv::Point2f> projectVerticesToImage(
     return projectedPoints;
 }
 
-// Fonction pour associer les points clés aux sommets 3D
 std::vector<std::pair<cv::Point2f, glm::vec3>> matchKeypointsTo3D(
     const std::vector<cv::KeyPoint>& keypoints,
     const std::vector<cv::Point2f>& projectedVertices,
     const std::vector<float>& vertices3D,
-    float maxDistancePixels = 10.0f // seuil maximum de distance en pixels
-) {
+    float maxDistancePixels = 3.0f) // Réduire le seuil pour plus de précision
+{
     std::vector<std::pair<cv::Point2f, glm::vec3>> matches;
 
     if (projectedVertices.empty() || vertices3D.empty()) return matches;
@@ -353,6 +353,7 @@ std::vector<std::pair<cv::Point2f, glm::vec3>> matchKeypointsTo3D(
 
     // Création du KD-Tree FLANN
     cv::flann::KDTreeIndexParams indexParams(5); // 5 arbres
+    projectedMat.convertTo(projectedMat, CV_32F);
     cv::flann::Index kdtree(projectedMat, indexParams);
 
     for (const auto& kp : keypoints) {
@@ -378,7 +379,17 @@ std::vector<std::pair<cv::Point2f, glm::vec3>> matchKeypointsTo3D(
         }
     }
 
-    return matches;
+    // Ajouter un filtre supplémentaire pour rejeter les correspondances douteuses
+    std::vector<std::pair<cv::Point2f, glm::vec3>> filteredMatches;
+    for (const auto& match : matches) {
+        // Vous pourriez ajouter des vérifications supplémentaires ici
+        // Par exemple, vérifier si la profondeur Z est raisonnable
+        if (match.second.z > -10.0f && match.second.z < 10.0f) {
+            filteredMatches.push_back(match);
+        }
+    }
+
+    return filteredMatches;
 }
 
 
@@ -411,8 +422,7 @@ bool estimateCameraPoseFromMatches(
     // Aucune distorsion supposée (ou tu peux la passer en paramètre si tu veux)
     cv::Mat distCoeffs = cv::Mat::zeros(5, 1, CV_64F);
 
-    // Résolution de PnP
-    bool success = cv::solvePnP(
+    bool success = cv::solvePnPRansac(
         objectPoints,
         imagePoints,
         cameraMatrix,
@@ -420,46 +430,51 @@ bool estimateCameraPoseFromMatches(
         rvec,
         tvec,
         useExtrinsicGuess,
-        cv::SOLVEPNP_ITERATIVE 
+        10000,           // Augmenter le nombre d'itérations
+        8.0,            // Seuil de reprojection
+        0.99,           // Niveau de confiance
+        cv::noArray(),  // Inliers
+        cv::SOLVEPNP_EPNP  // Utiliser EPNP au lieu d'ITERATIVE
     );
 
-    if (!success) {
-        std::cerr << "solvePnP a échoué" << std::endl;
-        return false;
+    // Raffiner la pose si la résolution initiale a réussi
+    if (success) {
+        cv::solvePnPRefineLM(objectPoints, imagePoints, cameraMatrix,
+            distCoeffs, rvec, tvec);
     }
 
-    return true;
+    return success;
 }
 
 glm::mat4 createViewMatrixFromPnP(const cv::Mat& rvec, const cv::Mat& tvec)
 {
+    // Convertir le vecteur de rotation en matrice de rotation
     cv::Mat R;
-    cv::Rodrigues(rvec, R); // convertir rvec en matrice de rotation 3x3
+    cv::Rodrigues(rvec, R);
 
-    // Construire une matrice de transformation 4x4
+    // Créer une matrice de transformation OpenGL
     glm::mat4 viewMatrix = glm::mat4(1.0f);
 
-    // OpenCV est en (X droite, Y bas, Z avant) → OpenGL (X droite, Y haut, Z arrière)
-    // Donc il faut inverser l'axe Y et Z
-    viewMatrix[0][0] = R.at<double>(0, 0);
-    viewMatrix[1][0] = -R.at<double>(0, 1); // inverser Y
-    viewMatrix[2][0] = -R.at<double>(0, 2); // inverser Z
-    viewMatrix[0][1] = R.at<double>(1, 0);
-    viewMatrix[1][1] = -R.at<double>(1, 1);
-    viewMatrix[2][1] = -R.at<double>(1, 2);
-    viewMatrix[0][2] = R.at<double>(2, 0);
-    viewMatrix[1][2] = -R.at<double>(2, 1);
-    viewMatrix[2][2] = -R.at<double>(2, 2);
+    // Remplir la matrice de rotation (transposée pour OpenGL)
+    // OpenCV: X droite, Y bas, Z avant
+    // OpenGL: X droite, Y haut, Z arrière
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            viewMatrix[i][j] = R.at<double>(j, i);
+        }
+    }
 
+    // Inverser Y et Z pour la conversion OpenCV -> OpenGL
+    viewMatrix[1][0] *= -1; viewMatrix[1][1] *= -1; viewMatrix[1][2] *= -1;
+    viewMatrix[2][0] *= -1; viewMatrix[2][1] *= -1; viewMatrix[2][2] *= -1;
+
+    // Appliquer la translation
     viewMatrix[3][0] = tvec.at<double>(0);
-    viewMatrix[3][1] = -tvec.at<double>(1);
-    viewMatrix[3][2] = -tvec.at<double>(2);
-    viewMatrix[3][3] = 1.0f;
+    viewMatrix[3][1] = -tvec.at<double>(1); // Inverser Y
+    viewMatrix[3][2] = -tvec.at<double>(2); // Inverser Z
 
-    // Inverser la matrice pour passer du modèle caméra au modèle monde
-    viewMatrix = glm::inverse(viewMatrix);
-
-    return viewMatrix;
+    // En OpenGL, nous voulons l'inverse de cette matrice pour la vue
+    return glm::inverse(viewMatrix);
 }
 
 
@@ -782,18 +797,21 @@ bool alignMeshWithImage(const char* imagePath,
     int image_height = referenceImage.rows;
 
     // 1. Projetter les sommets sur l'image
-    std::vector<cv::Point2f> projectedVertices = projectVerticesToImage(vertices, MVP, image_width, image_height);
+    glm::mat4 tempMVP = projection * view * model;
+    std::vector<cv::Point2f> projectedVertices = projectVerticesToImage(vertices, tempMVP, image_width, image_height);
 
     // 2. Matcher les keypoints détectés sur l'image du mesh
     std::vector<std::pair<cv::Point2f, glm::vec3>> matchedPoints = matchKeypointsTo3D(keypointsMesh, projectedVertices, vertices);
 
     // 3. Utiliser les correspondances
+    cv::Mat debugImage = meshRendering.clone();
+    for (const auto& m : matchedPoints) {
+        cv::circle(debugImage, m.first, 4, cv::Scalar(0, 255, 0), -1);
+    }
+    cv::imwrite("debug_matched_points.png", debugImage);
     for (const auto& match : matchedPoints) {
         const cv::Point2f& keypoint2D = match.first;
         const glm::vec3& point3D = match.second;
-
-        std::cout << "Keypoint (" << keypoint2D.x << ", " << keypoint2D.y
-            << ") correspond au 3D point " << glm::to_string(point3D) << std::endl;
     }
 
     //-----------------------------------------------------------------------------
@@ -805,7 +823,7 @@ bool alignMeshWithImage(const char* imagePath,
     cv::Mat rvec, tvec;
     
     //  Appeler la fonction
-    bool poseFound = estimateCameraPoseFromMatches(matchedPoints, cameraMatrix, rvec, tvec);
+    poseFound = estimateCameraPoseFromMatches(matchedPoints, cameraMatrix, rvec, tvec);
 
     if (poseFound) {
         std::cout << "Rotation (Rodrigues) : " << rvec.t() << std::endl;
@@ -860,80 +878,6 @@ bool alignMeshWithImage(const char* imagePath,
 
 
 float overlayScale = 0.8f;
-// Fonction pour initialiser le plan d'overlay
-void setupOverlay() {
-    // Définir les sommets du plan (quad)
-    float overlayVertices[] = {
-        // Positions         
-        -overlayScale,  overlayScale, 0.0f, 0.0f, 0.0f, 
-         overlayScale,  overlayScale, 0.0f, 1.0f, 0.0f,
-         overlayScale, -overlayScale, 0.0f, 1.0f, 1.0f, 
-        -overlayScale, -overlayScale, 0.0f, 0.0f, 1.0f 
-    };
-
-
-    unsigned int overlayIndices[] = {
-        0, 1, 2,
-        0, 2, 3
-    };
-
-    // Créer le VAO, VBO et EBO pour l'overlay
-    glGenVertexArrays(1, &overlayVAO);
-    glGenBuffers(1, &overlayVBO);
-    glGenBuffers(1, &overlayEBO);
-
-    glBindVertexArray(overlayVAO);
-
-    glBindBuffer(GL_ARRAY_BUFFER, overlayVBO);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(overlayVertices), overlayVertices, GL_STATIC_DRAW);
-
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, overlayEBO);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(overlayIndices), overlayIndices, GL_STATIC_DRAW);
-
-    // Attributs de position
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
-
-    // Attributs de coordonnées de texture
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
-    glEnableVertexAttribArray(1);
-
-    glBindVertexArray(0);
-
-    // Charger la texture de l'overlay (remplacez par le chemin de votre image)
-    overlayTexture = loadTexture("D:/project/PComNorm/baseColor.png"); // Remplacez par le chemin de votre image
-
-    // Shaders pour l'overlay
-    const char* overlayVertexShaderSource = R"(
-        #version 330 core
-        layout (location = 0) in vec3 aPos;
-        layout (location = 1) in vec2 aTexCoord;
-        
-        out vec2 TexCoord;
-        
-        void main() {
-            gl_Position = vec4(aPos, 1.0);
-            TexCoord = aTexCoord;
-        }
-    )";
-
-    const char* overlayFragmentShaderSource = R"(
-        #version 330 core
-        in vec2 TexCoord;
-        out vec4 FragColor;
-        
-        uniform sampler2D overlayTexture;
-        uniform float transparency = 0.7; // Contrôle la transparence
-        
-        void main() {
-            vec4 texColor = texture(overlayTexture, TexCoord);
-            // Appliquer la transparence globale
-            FragColor = vec4(texColor.rgb, texColor.a * transparency);
-        }
-    )";
-
-    overlayShaderProgram = createShaderProgram(overlayVertexShaderSource, overlayFragmentShaderSource);
-}
 
 
 // Modification de la fonction processInput pour utiliser la vue de caméra actuelle
@@ -942,20 +886,26 @@ void processInput() {
     glm::vec3 worldRight = glm::vec3(1.0f, 0.0f, 0.0f);   // Axe X
     glm::vec3 worldUp = glm::vec3(0.0f, 1.0f, 0.0f);      // Axe Y
     glm::vec3 worldForward = glm::vec3(0.0f, 0.0f, -1.0f); // Axe Z (négatif car OpenGL)
+    if (!poseFound) {
 
-    // Déplacement caméra sur les axes mondiaux avec ZQSD
-    if (keys[GLFW_KEY_W] || keys[GLFW_KEY_Z])
-        cameraTarget += worldForward * cameraSpeed;
-    if (keys[GLFW_KEY_S])
-        cameraTarget -= worldForward * cameraSpeed;
-    if (keys[GLFW_KEY_A] || keys[GLFW_KEY_Q])
-        cameraTarget -= worldRight * cameraSpeed;
-    if (keys[GLFW_KEY_D])
-        cameraTarget += worldRight * cameraSpeed;
 
+        if (keys[GLFW_KEY_W] || keys[GLFW_KEY_Z])
+            cameraTarget += worldForward * cameraSpeed;
+        if (keys[GLFW_KEY_S])
+            cameraTarget -= worldForward * cameraSpeed;
+        if (keys[GLFW_KEY_A] || keys[GLFW_KEY_Q])
+            cameraTarget -= worldRight * cameraSpeed;
+        if (keys[GLFW_KEY_D])
+            cameraTarget += worldRight * cameraSpeed;
+        if (keys[GLFW_KEY_SPACE])
+            cameraTarget += worldUp * cameraSpeed;
+        if (keys[GLFW_KEY_LEFT_CONTROL] || keys[GLFW_KEY_RIGHT_CONTROL])
+            cameraTarget -= worldUp * cameraSpeed;
+    }
     if (keys[GLFW_KEY_E]) {
+        
         bool alignmentSuccess = alignMeshWithImage(
-            "D:/project/PComNorm/roughness.png", // Chemin de l'image de référence
+            "D:/project/PComNorm/baseColor.png", // Chemin de l'image de référence
             vertices,                            // Vos vertices
             indices,                             // Vos indices
             normals,                             // Vos normales
@@ -965,10 +915,11 @@ void processInput() {
             Model,                               // Matrice modèle actuelle
             alignmentMatrix                      // Matrice de sortie
         );
-
+        /*
         if (alignmentSuccess) {
-            Model = alignmentMatrix * Model;
+            Model =  transpose(alignmentMatrix * Model);
         }
+        */
     }
 
     // Déplacement haut/bas sur l'axe Y
@@ -1034,7 +985,7 @@ int main() {
   // Pour stocker les normales du maillage
 
     // Charger le maillage avec les normales
-    if (!loadPLY("D:/project/PComNorm/point_cloud_1Cloud.ply", vertices, indices, normals)) {
+    if (!loadPLY("D:/project/PComNorm/Chemi-AU-O005.ply", vertices, indices, normals)) {
         return -1;
     }
 
@@ -1072,7 +1023,7 @@ int main() {
     layout (location = 0) in vec3 aPos;
     layout (location = 1) in vec3 aNormal; // Ajout des normales
     
-    uniform mat4 model;
+    uniform mat4 Model;
     uniform mat4 view;
     uniform mat4 projection;
     uniform mat4 MVP;
@@ -1082,9 +1033,9 @@ int main() {
     
     void main() {
         gl_Position = MVP * vec4(aPos, 1.0);
-        FragPos = vec3(model * vec4(aPos, 1.0));
+        FragPos = vec3(Model * vec4(aPos, 1.0));
         // Transposer l'inverse de la matrice modèle pour les normales
-        Normal = mat3(transpose(inverse(model))) * aNormal;
+        Normal = mat3(transpose(inverse(Model))) * aNormal;
     }
 )";
 
@@ -1142,32 +1093,33 @@ int main() {
         glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         processInput();
-        // Calculer la matrice de vue
-         cameraPos = glm::vec3(
-            cameraDistance * sin(glm::radians(cameraAngleY)) * cos(glm::radians(cameraAngleX)),
-            cameraDistance * sin(glm::radians(cameraAngleX)),
-            cameraDistance * cos(glm::radians(cameraAngleY)) * cos(glm::radians(cameraAngleX))
-        );
+        if (poseFound == false) {
+            cameraPos = glm::vec3(
+                cameraDistance * sin(glm::radians(cameraAngleY)) * cos(glm::radians(cameraAngleX)),
+                cameraDistance * sin(glm::radians(cameraAngleX)),
+                cameraDistance * cos(glm::radians(cameraAngleY)) * cos(glm::radians(cameraAngleX))
+            );
 
-        cameraPos += cameraTarget;
-
-        // La matrice de vue pointe vers la cible
-        if (poseFound==false)
-        {
-            view = glm::lookAt(cameraPos, cameraTarget, glm::vec3(0.0f, 1.0f, 0.0f));
+            cameraPos += cameraTarget;
+           
         }
-        else
-        {
-			view = newview;
+        else {
+            glm::mat4 invView = glm::inverse(newview);
+            cameraPos = glm::vec3(invView[3]); 
         }
-
-        // Matrice Model pour l'objet 3D
-        Model = glm::mat4(1.0f);
-       // Model = translate(Model, glm::vec3(0, 0, cameraDistance));
-        Model = rotate(Model, glm::radians(objectRotationX), glm::vec3(1, 0, 0));
-        Model = rotate(Model, glm::radians(objectRotationY), glm::vec3(0, 1, 0));
-        Model = scale(Model, glm::vec3(.8, .8, .8));
-        Model = transpose(Model);
+        view = glm::lookAt(cameraPos, cameraTarget, glm::vec3(0.0f, 1.0f, 0.0f));
+        
+        
+        if (modelbool==false)
+        {
+            // Matrice Model pour l'objet 3D
+            Model = glm::mat4(1.0f);
+            // Model = translate(Model, glm::vec3(0, 0, cameraDistance));
+            Model = rotate(Model, glm::radians(objectRotationX), glm::vec3(1, 0, 0));
+            Model = rotate(Model, glm::radians(objectRotationY), glm::vec3(0, 1, 0));
+            Model = scale(Model, glm::vec3(.8, .8, .8));
+           
+        }
 
         MVP = projection * view * Model;
 
@@ -1190,21 +1142,6 @@ int main() {
 
         glBindVertexArray(VAO);
         glDrawElements(GL_TRIANGLES, indices.size(), GL_UNSIGNED_INT, 0);
-        /*
-        // Désactiver temporairement le test de profondeur pour l'overlay
-        glDisable(GL_DEPTH_TEST);
-        
-        // Dessiner le plan d'overlay
-        glUseProgram(overlayShaderProgram);
-        glBindVertexArray(overlayVAO);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, overlayTexture);
-        glUniform1i(glGetUniformLocation(overlayShaderProgram, "overlayTexture"), 0);
-        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-        
-        // Réactiver le test de profondeur
-        glEnable(GL_DEPTH_TEST);
-        */
         // Échange des buffers
         glfwSwapBuffers(window);
         glfwPollEvents();
@@ -1220,7 +1157,6 @@ int main() {
     glDeleteBuffers(1, &overlayVBO);
     glDeleteBuffers(1, &overlayEBO);
     glDeleteBuffers(1, &normalVBO);
-    glDeleteTextures(1, &overlayTexture);
     glDeleteProgram(overlayShaderProgram);
 
     glfwDestroyWindow(window);
