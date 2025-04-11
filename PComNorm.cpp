@@ -915,11 +915,6 @@ void processInput() {
             Model,                               // Matrice modèle actuelle
             alignmentMatrix                      // Matrice de sortie
         );
-        /*
-        if (alignmentSuccess) {
-            Model =  transpose(alignmentMatrix * Model);
-        }
-        */
     }
 
     // Déplacement haut/bas sur l'axe Y
@@ -1105,7 +1100,8 @@ int main() {
         }
         else {
             glm::mat4 invView = glm::inverse(newview);
-            cameraPos = glm::vec3(invView[3]); 
+            cameraPos = glm::vec3(invView[3]);
+			cameraPos = -cameraPos;
         }
         view = glm::lookAt(cameraPos, cameraTarget, glm::vec3(0.0f, 1.0f, 0.0f));
         
