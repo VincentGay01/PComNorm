@@ -272,42 +272,6 @@ bool loadPLY(const std::string& filename, std::vector<float>& vertices, std::vec
     return true;
 }
 
-// Fonction pour charger une texture
-GLuint loadTexture(const char* path) {
-    GLuint textureID;
-    glGenTextures(1, &textureID);
-
-    int width, height, nrChannels;
-    unsigned char* data = stbi_load(path, &width, &height, &nrChannels, 0);
-    if (data) {
-        GLenum format;
-        if (nrChannels == 1)
-            format = GL_RED;
-        else if (nrChannels == 3)
-            format = GL_RGB;
-        else if (nrChannels == 4)
-            format = GL_RGBA;
-
-        glBindTexture(GL_TEXTURE_2D, textureID);
-        glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
-        glGenerateMipmap(GL_TEXTURE_2D);
-
-        // Paramètres de texture
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-        stbi_image_free(data);
-    }
-    else {
-        std::cout << "Échec du chargement de la texture à " << path << std::endl;
-        stbi_image_free(data);
-    }
-
-    return textureID;
-}
-
 // Fonction pour projeter les sommets sur l'image
 std::vector<cv::Point2f> projectVerticesToImage(
     const std::vector<float>& vertices,
@@ -430,8 +394,8 @@ bool estimateCameraPoseFromMatches(
         rvec,
         tvec,
         useExtrinsicGuess,
-        10000,           // Augmenter le nombre d'itérations
-        8.0,            // Seuil de reprojection
+        50000,           // Augmenter le nombre d'itérations
+        7.0,            // Seuil de reprojection
         0.99,           // Niveau de confiance
         cv::noArray(),  // Inliers
         cv::SOLVEPNP_EPNP  // Utiliser EPNP au lieu d'ITERATIVE
@@ -775,7 +739,7 @@ bool alignMeshWithImage(const char* imagePath,
     }
 
     // 5. Filtrer les correspondances de bonne qualité
-    const float ratioThresh = 1.f;
+    const float ratioThresh = 0.7f;
     std::vector<cv::DMatch> goodMatches;
     for (size_t i = 0; i < knnMatches.size(); i++) {
         if (knnMatches[i].size() < 2) continue; // Ignorer les matchs incomplets
