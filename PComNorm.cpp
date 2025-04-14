@@ -16,7 +16,12 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/features2d.hpp>
 #include <opencv2/calib3d.hpp>
+
+std::string err, warn;
+std::vector<float> texCoords;
 std::vector<float> normals;
+std::vector<int> texNumbers;
+std::vector<std::string> textureFiles;
 bool poseFound = false;
 bool modelbool = false;
 // Variables globales pour la caméra
@@ -38,6 +43,8 @@ GLuint overlayVAO, overlayVBO, overlayEBO;
 GLuint overlayTexture;
 GLuint overlayShaderProgram;
 GLuint shaderProgram;
+GLuint texCoordVBO;
+GLuint textureID;
 glm::vec3 cameraPos;
 glm::mat4 view;
 glm::mat4 newview;
@@ -146,8 +153,9 @@ GLuint createShaderProgram(const char* vertexSource, const char* fragmentSource)
     return shaderProgram;
 }
 
-// Fonction pour lire un fichier .ply avec support des normales
-bool loadPLY(const std::string& filename, std::vector<float>& vertices, std::vector<unsigned int>& indices, std::vector<float>& normals) {
+bool loadPLY(const std::string& filename, std::vector<float>& vertices, std::vector<unsigned int>& indices,
+    std::vector<float>& normals, std::vector<float>& texCoords, std::vector<int>& texNumbers,
+    std::vector<std::string>& textureFiles) {
     std::ifstream file(filename);
     if (!file.is_open()) {
         std::cerr << "Erreur : Impossible d'ouvrir le fichier " << filename << std::endl;
@@ -158,6 +166,10 @@ bool loadPLY(const std::string& filename, std::vector<float>& vertices, std::vec
     bool headerEnded = false;
     int vertexCount = 0, faceCount = 0;
     bool hasNormals = false;
+    bool hasTexCoords = false;
+    bool hasTexNumber = false;
+    bool hasTexCoordList = false;
+    bool hasTextureFile = false;
 
     // Lecture de l'en-tête
     while (std::getline(file, line)) {
@@ -177,6 +189,29 @@ bool loadPLY(const std::string& filename, std::vector<float>& vertices, std::vec
         }
         else if (word == "property" && line.find("nx") != std::string::npos) {
             hasNormals = true;
+        }
+        else if (word == "property" && (line.find("s") != std::string::npos ||
+            line.find("u") != std::string::npos ||
+            line.find("texture_u") != std::string::npos)) {
+            hasTexCoords = true;
+        }
+        else if (word == "property" && line.find("texnumber") != std::string::npos) {
+            hasTexNumber = true;
+        }
+        else if (word == "property" && line.find("list") != std::string::npos && line.find("texcoord") != std::string::npos) {
+            hasTexCoordList = true;
+        }
+        else if (word == "comment" && line.find("TextureFile") != std::string::npos) {
+            // Extraction du nom du fichier de texture depuis le commentaire
+            size_t pos = line.find("TextureFile");
+            if (pos != std::string::npos) {
+                std::string texturePath = line.substr(pos + 11); // 11 est la longueur de "TextureFile"
+                // Supprimer les espaces en début et fin
+                texturePath.erase(0, texturePath.find_first_not_of(" \t"));
+                texturePath.erase(texturePath.find_last_not_of(" \t") + 1);
+                textureFiles.push_back(texturePath);
+                hasTextureFile = true;
+            }
         }
     }
 
@@ -211,6 +246,21 @@ bool loadPLY(const std::string& filename, std::vector<float>& vertices, std::vec
             normals.push_back(ny);
             normals.push_back(nz);
         }
+
+        if (hasTexCoords && !hasTexCoordList) {
+            // Si le fichier contient des coordonnées de texture standard, les lire
+            float u, v;
+            iss >> u >> v;
+            texCoords.push_back(u);
+            texCoords.push_back(v);
+        }
+
+        if (hasTexNumber) {
+            // Si le fichier contient un numéro de texture, le lire
+            int texNum;
+            iss >> texNum;
+            texNumbers.push_back(texNum);
+        }
     }
 
     // Stocker les triangles pour calculer les normales si nécessaire
@@ -220,15 +270,64 @@ bool loadPLY(const std::string& filename, std::vector<float>& vertices, std::vec
     for (int i = 0; i < faceCount; ++i) {
         std::getline(file, line);
         std::istringstream iss(line);
-        int vertexCount, v1, v2, v3;
-        iss >> vertexCount >> v1 >> v2 >> v3;
-        if (vertexCount == 3) { // On ne gère que les triangles
-            indices.push_back(v1);
-            indices.push_back(v2);
-            indices.push_back(v3);
 
-            // Stocker le triangle pour le calcul des normales
-            triangles.push_back(glm::uvec3(v1, v2, v3));
+        if (hasTexCoordList) {
+            // Format: nombre_vertices v1 v2 v3 nombre_coords_tex tx1 ty1 tx2 ty2 tx3 ty3
+            int vertexCount, v1, v2, v3;
+            iss >> vertexCount >> v1 >> v2 >> v3;
+
+            if (vertexCount == 3) { // On ne gère que les triangles
+                indices.push_back(v1);
+                indices.push_back(v2);
+                indices.push_back(v3);
+
+                // Stocker le triangle pour le calcul des normales
+                triangles.push_back(glm::uvec3(v1, v2, v3));
+
+                // Lire le nombre de coordonnées de texture
+                unsigned char numTexCoords;
+                iss >> numTexCoords;
+
+                // Lire les coordonnées de texture pour chaque sommet du triangle
+                for (int j = 0; j < numTexCoords && j < vertexCount * 2; j += 2) {
+                    float u, v;
+                    iss >> u >> v;
+
+                    // Assurez-vous que texCoords a suffisamment d'espace
+                    while (texCoords.size() <= v1 * 2 + j + 1) {
+                        texCoords.push_back(0.0f);
+                        texCoords.push_back(0.0f);
+                    }
+
+                    // Stocker les coordonnées de texture
+                    if (j == 0) {
+                        texCoords[v1 * 2] = u;
+                        texCoords[v1 * 2 + 1] = v;
+                    }
+                    else if (j == 2) {
+                        texCoords[v2 * 2] = u;
+                        texCoords[v2 * 2 + 1] = v;
+                    }
+                    else if (j == 4) {
+                        texCoords[v3 * 2] = u;
+                        texCoords[v3 * 2 + 1] = v;
+                    }
+                }
+            }
+        }
+        else {
+            // Format standard: nombre_vertices v1 v2 v3
+            int vertexCount, v1, v2, v3;
+            iss >> vertexCount >> v1 >> v2 >> v3;
+
+            if (vertexCount == 3) { // On ne gère que les triangles
+                indices.push_back(v1);
+                indices.push_back(v2);
+                indices.push_back(v3);
+
+                // Stocker le triangle pour le calcul des normales
+                triangles.push_back(glm::uvec3(v1, v2, v3));
+            }
         }
     }
 
@@ -269,8 +368,14 @@ bool loadPLY(const std::string& filename, std::vector<float>& vertices, std::vec
         }
     }
 
+    // Si le fichier ne contient pas de coordonnées de texture, initialiser avec des valeurs par défaut
+    if (!hasTexCoords && !hasTexCoordList) {
+        texCoords.resize(positions.size() * 2, 0.0f);
+    }
+
     return true;
 }
+
 
 // Fonction pour projeter les sommets sur l'image
 std::vector<cv::Point2f> projectVerticesToImage(
@@ -302,7 +407,7 @@ std::vector<std::pair<cv::Point2f, glm::vec3>> matchKeypointsTo3D(
     const std::vector<cv::KeyPoint>& keypoints,
     const std::vector<cv::Point2f>& projectedVertices,
     const std::vector<float>& vertices3D,
-    float maxDistancePixels = 3.0f) // Réduire le seuil pour plus de précision
+    float maxDistancePixels = 1.0f) // Réduire le seuil pour plus de précision
 {
     std::vector<std::pair<cv::Point2f, glm::vec3>> matches;
 
@@ -316,7 +421,7 @@ std::vector<std::pair<cv::Point2f, glm::vec3>> matchKeypointsTo3D(
     }
 
     // Création du KD-Tree FLANN
-    cv::flann::KDTreeIndexParams indexParams(5); // 5 arbres
+    cv::flann::KDTreeIndexParams indexParams(6); // 5 arbres
     projectedMat.convertTo(projectedMat, CV_32F);
     cv::flann::Index kdtree(projectedMat, indexParams);
 
@@ -363,7 +468,7 @@ bool estimateCameraPoseFromMatches(
     const cv::Mat& cameraMatrix,
     cv::Mat& rvec,
     cv::Mat& tvec,
-    bool useExtrinsicGuess = false)
+    bool useExtrinsicGuess = true)
 {
     if (matches.size() < 4) {
         std::cerr << "Pas assez de correspondances pour solvePnP (minimum 4 requis)" << std::endl;
@@ -394,11 +499,11 @@ bool estimateCameraPoseFromMatches(
         rvec,
         tvec,
         useExtrinsicGuess,
-        50000,           // Augmenter le nombre d'itérations
-        7.0,            // Seuil de reprojection
+        100000,           // Augmenter le nombre d'itérations
+        2.0,            // Seuil de reprojection
         0.99,           // Niveau de confiance
         cv::noArray(),  // Inliers
-        cv::SOLVEPNP_EPNP  // Utiliser EPNP au lieu d'ITERATIVE
+        cv::SOLVEPNP_SQPNP  
     );
 
     // Raffiner la pose si la résolution initiale a réussi
@@ -445,8 +550,10 @@ glm::mat4 createViewMatrixFromPnP(const cv::Mat& rvec, const cv::Mat& tvec)
 //fonction pour prendre photo de la scène
 cv::Mat renderMeshToImage(const std::vector<float>& vertices,
     const std::vector<unsigned int>& indices,
-    const std::vector<float>& normals, // Ajout des normales en paramètre
+    const std::vector<float>& normals,
+    const std::vector<float>& texCoords, 
     GLuint shaderProgram,
+    GLuint textureID,                    
     const glm::mat4& view,
     const glm::mat4& projection,
     const glm::mat4& model,
@@ -470,8 +577,12 @@ cv::Mat renderMeshToImage(const std::vector<float>& vertices,
     glGenTextures(1, &renderTexture);
     glBindTexture(GL_TEXTURE_2D, renderTexture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    // Paramètres de texture
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, renderTexture, 0);
 
     // Créer un renderbuffer pour la profondeur
@@ -496,7 +607,7 @@ cv::Mat renderMeshToImage(const std::vector<float>& vertices,
 
     // Configurer la vue de rendu
     glViewport(0, 0, width, height);
-    glClearColor(0.2f, 0.3f, 0.3f, 1.0f); // Même couleur d'arrière-plan que l'écran principal
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // Même couleur d'arrière-plan que l'écran principal
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     // Activer le test de profondeur si ce n'est pas déjà fait
@@ -507,10 +618,11 @@ cv::Mat renderMeshToImage(const std::vector<float>& vertices,
     }
 
     // Créer un VAO et VBO temporaires pour ce rendu
-    GLuint tempVAO, tempVBO, tempNormalVBO, tempEBO;
+    GLuint tempVAO, tempVBO, tempNormalVBO, tempEBO, tempTexCoordVBO;
     glGenVertexArrays(1, &tempVAO);
     glGenBuffers(1, &tempVBO);
-    glGenBuffers(1, &tempNormalVBO); // Nouveau buffer pour les normales
+    glGenBuffers(1, &tempNormalVBO); 
+    glGenBuffers(1, &tempTexCoordVBO);   
     glGenBuffers(1, &tempEBO);
 
     glBindVertexArray(tempVAO);
@@ -527,6 +639,12 @@ cv::Mat renderMeshToImage(const std::vector<float>& vertices,
     glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
     glEnableVertexAttribArray(1);
 
+    //Buffer pour les texCoords
+    glBindBuffer(GL_ARRAY_BUFFER, tempTexCoordVBO);
+    glBufferData(GL_ARRAY_BUFFER, texCoords.size() * sizeof(float), texCoords.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(2);
+
     // Buffer pour les indices
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, tempEBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
@@ -537,7 +655,7 @@ cv::Mat renderMeshToImage(const std::vector<float>& vertices,
     // Utiliser EXACTEMENT le même modèle et matrices que dans l'affichage principal
     glm::mat4 MVP = projection * view * model;
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "MVP"), 1, GL_FALSE, glm::value_ptr(MVP));
-    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, glm::value_ptr(model));
+    glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "Model"), 1, GL_FALSE, glm::value_ptr(model));
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
     glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
 
@@ -558,6 +676,10 @@ cv::Mat renderMeshToImage(const std::vector<float>& vertices,
     glUniform1f(glGetUniformLocation(shaderProgram, "shininess"), shininess);
 
     // Dessiner le maillage
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, textureID);
+    glUniform1i(glGetUniformLocation(shaderProgram, "texture1"), 1); // 'texture1' dans ton shader
+
     glDrawElements(GL_TRIANGLES, indices.size(), GL_UNSIGNED_INT, 0);
 
     // Lire les pixels du framebuffer
@@ -584,7 +706,7 @@ cv::Mat renderMeshToImage(const std::vector<float>& vertices,
     glDeleteBuffers(1, &tempVBO);
     glDeleteBuffers(1, &tempNormalVBO);
     glDeleteBuffers(1, &tempEBO);
-
+    glDeleteBuffers(1, &tempTexCoordVBO);
     glDeleteTextures(1, &renderTexture);
     glDeleteRenderbuffers(1, &depthBuffer);
     glDeleteFramebuffers(1, &fbo);
@@ -601,72 +723,6 @@ cv::Mat renderMeshToImage(const std::vector<float>& vertices,
 }
 
 
-// Fonction pour convertir une homographie en matrice de modèle
-glm::mat4 homographyToModelMatrix(const cv::Mat& H) {
-    // Vérifier si l'homographie est valide
-    if (H.empty() || H.rows != 3 || H.cols != 3) {
-        std::cerr << "Homographie invalide" << std::endl;
-        return glm::mat4(1.0f); // Retourner une matrice identité en cas d'erreur
-    }
-
-    // Décomposer l'homographie en rotation et translation
-    // Nous avons besoin d'une matrice de caméra approchée
-    cv::Mat cameraMatrix = cv::Mat::eye(3, 3, CV_64F);
-    cameraMatrix.at<double>(0, 0) = 2252.308217738484; // Valeur approximative de fx (focale x)
-    cameraMatrix.at<double>(1, 1) = 2252.308217738484; // Valeur approximative de fy (focale y)
-    cameraMatrix.at<double>(0, 2) = 1352.0; // Valeur approximative de cx (centre x)
-    cameraMatrix.at<double>(1, 2) = 900.0; // Valeur approximative de cy (centre y)
-
-    std::vector<cv::Mat> rotations, translations, normals;
-
-    try {
-        // Décomposer l'homographie en solutions possibles
-        cv::decomposeHomographyMat(H, cameraMatrix, rotations, translations, normals);
-
-        if (rotations.empty() || translations.empty()) {
-            std::cerr << "Échec de la décomposition de l'homographie" << std::endl;
-            return glm::mat4(1.0f);
-        }
-
-        std::cout << "Nombre de solutions possibles: " << rotations.size() << std::endl;
-
-        // Sélectionner la première solution (index 0)
-        // Dans une implémentation plus robuste, vous pourriez vouloir choisir
-        // la meilleure solution selon un critère spécifique
-        cv::Mat R = rotations[0];  // Matrice de rotation 3x3
-        cv::Mat t = translations[0]; // Vecteur de translation 3x1
-
-        // Convertir en matrice de modèle glm 4x4
-        glm::mat4 modelMatrix(1.0f);
-
-        // Remplir la sous-matrice 3x3 avec la rotation (transposée pour OpenGL)
-        for (int i = 0; i < 3; i++) {
-            for (int j = 0; j < 3; j++) {
-                // Transposer la matrice car OpenGL utilise une convention différente
-                modelMatrix[j][i] = static_cast<float>(R.at<double>(i, j));
-            }
-        }
-
-        // Ajouter la translation (ajuster selon les besoins)
-        modelMatrix[3][0] = static_cast<float>(t.at<double>(0, 0));
-        modelMatrix[3][1] = static_cast<float>(t.at<double>(1, 0));
-        modelMatrix[3][2] = static_cast<float>(t.at<double>(2, 0));
-
-        // Ajustements possibles pour aligner correctement
-        // Ces valeurs peuvent nécessiter des ajustements selon votre setup
-        float scaleFactor = 0.1f;  // Facteur d'échelle à ajuster selon les besoins
-
-        glm::mat4 scaleMatrix = glm::scale(glm::mat4(1.0f), glm::vec3(scaleFactor));
-        modelMatrix = modelMatrix * scaleMatrix;
-
-        return modelMatrix;
-
-    }
-    catch (const cv::Exception& e) {
-        std::cerr << "Exception pendant la décomposition de l'homographie: " << e.what() << std::endl;
-        return glm::mat4(1.0f);
-    }
-}
 
 // Fonction modifiée pour prendre en compte les matrices de vue et de projection actuelles
 bool alignMeshWithImage(const char* imagePath,
@@ -687,8 +743,8 @@ bool alignMeshWithImage(const char* imagePath,
     }
 
     // 2. Préparer une image de rendu du maillage 3D avec la vue de caméra actuelle
-    cv::Mat meshRendering = renderMeshToImage(vertices, indices, normals,
-        shaderProgram, view, projection, model,
+    cv::Mat meshRendering = renderMeshToImage(vertices, indices, normals, texCoords,
+        shaderProgram,textureID ,view, projection, model,
         referenceImage.cols, referenceImage.rows);
 
     // Optionnel: Sauvegarder les images pour débogage
@@ -817,26 +873,6 @@ bool alignMeshWithImage(const char* imagePath,
         pointsRef.push_back(keypointsRef[goodMatches[i].queryIdx].pt);
         pointsMesh.push_back(keypointsMesh[goodMatches[i].trainIdx].pt);
     }
-
-    // 7. Calculer l'homographie entre les deux ensembles de points
-    cv::Mat H;
-    try {
-        H = cv::findHomography(pointsMesh, pointsRef, cv::RANSAC, 3.0);
-
-        if (H.empty()) {
-            std::cerr << "Erreur: Impossible de calculer l'homographie" << std::endl;
-            return false;
-        }
-    }
-    catch (const cv::Exception& e) {
-        std::cerr << "Erreur lors du calcul de l'homographie: " << e.what() << std::endl;
-        return false;
-    }
-
-    // 8. Convertir cette homographie en matrice de transformation 3D
-    outModelMatrix = homographyToModelMatrix(H);
-
-    std::cout << "Alignement réussi. Matrice de transformation générée." << std::endl;
     return true;
 }
 
@@ -869,7 +905,7 @@ void processInput() {
     if (keys[GLFW_KEY_E]) {
         
         bool alignmentSuccess = alignMeshWithImage(
-            "D:/project/PComNorm/baseColor.png", // Chemin de l'image de référence
+            "D:/project/PComNorm/shoe1.png", // Chemin de l'image de référence
             vertices,                            // Vos vertices
             indices,                             // Vos indices
             normals,                             // Vos normales
@@ -936,17 +972,11 @@ int main() {
 
     // Activer le test de profondeur
     glEnable(GL_DEPTH_TEST);
-
-    // Configurer l'overlay
-  //  setupOverlay();
-
-    // Dans la fonction main(), ajouter ces variables pour l'éclairage
-  // Pour stocker les normales du maillage
-
-    // Charger le maillage avec les normales
-    if (!loadPLY("D:/project/PComNorm/Chemi-AU-O005.ply", vertices, indices, normals)) {
+    
+    if (!loadPLY("D:/project/PComNorm/Chemi-AU-O0051.ply", vertices, indices, normals, texCoords, texNumbers, textureFiles)) {
         return -1;
     }
+
 
     // Création du VAO, VBO et EBO avec support pour les normales
     GLuint VAO, VBO, normalVBO, EBO;
@@ -954,8 +984,53 @@ int main() {
     glGenBuffers(1, &VBO);
     glGenBuffers(1, &normalVBO);
     glGenBuffers(1, &EBO);
-
+    glGenBuffers(1, &texCoordVBO);
     glBindVertexArray(VAO);
+
+    glGenTextures(1, &textureID);
+    glBindTexture(GL_TEXTURE_2D, textureID);
+
+    // Paramètres de texture
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+
+    // Vérifier si nous avons des chemins de texture
+    if (!textureFiles.empty()) {
+        // Utiliser le premier fichier de texture trouvé dans le PLY
+        std::string texturePath = "D:/project/PComNorm/" + textureFiles[0];  // Ajuster le chemin si nécessaire
+
+        int texWidth, texHeight, texChannels;
+        unsigned char* data = stbi_load(texturePath.c_str(), &texWidth, &texHeight, &texChannels, 0);
+        if (data) {
+            GLenum format = (texChannels == 4) ? GL_RGBA : GL_RGB;
+            glTexImage2D(GL_TEXTURE_2D, 0, format, texWidth, texHeight, 0, format, GL_UNSIGNED_BYTE, data);
+            glGenerateMipmap(GL_TEXTURE_2D);
+            stbi_image_free(data);  // Libérer la mémoire
+            std::cout << "Texture chargée avec succès: " << texturePath << std::endl;
+        }
+        else {
+            std::cerr << "Échec du chargement de la texture: " << texturePath << std::endl;
+            std::cerr << "Erreur STBI: " << stbi_failure_reason() << std::endl;
+        }
+    }
+    else {
+        std::cerr << "Aucun fichier de texture trouvé dans le PLY" << std::endl;
+    }
+    
+
+    // Afficher quelques coordonnées de texture pour débogage
+    std::cout << "Nombre de coordonnées de texture: " << texCoords.size() / 2 << std::endl;
+    if (!texCoords.empty()) {
+        for (int i = 0; i < std::min(10, (int)texCoords.size() / 2); i++) {
+            std::cout << "TexCoord[" << i << "]: (" << texCoords[i * 2] << ", " << texCoords[i * 2 + 1] << ")" << std::endl;
+        }
+    }
+
+  
+
 
     // Buffer pour les positions
     glBindBuffer(GL_ARRAY_BUFFER, VBO);
@@ -973,6 +1048,14 @@ int main() {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.size() * sizeof(unsigned int), indices.data(), GL_STATIC_DRAW);
 
+    // Buffer pour les texCoords
+    glBindBuffer(GL_ARRAY_BUFFER, texCoordVBO);
+    glBufferData(GL_ARRAY_BUFFER, texCoords.size() * sizeof(float), texCoords.data(), GL_STATIC_DRAW);
+    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+    glEnableVertexAttribArray(2);
+
+
+
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
 
@@ -981,7 +1064,7 @@ int main() {
     #version 330 core
     layout (location = 0) in vec3 aPos;
     layout (location = 1) in vec3 aNormal; // Ajout des normales
-    
+    layout (location = 2) in vec2 aTexCoord;
     uniform mat4 Model;
     uniform mat4 view;
     uniform mat4 projection;
@@ -989,12 +1072,13 @@ int main() {
     
     out vec3 FragPos;
     out vec3 Normal;
-    
+    out vec2 TexCoord;
     void main() {
         gl_Position = MVP * vec4(aPos, 1.0);
         FragPos = vec3(Model * vec4(aPos, 1.0));
         // Transposer l'inverse de la matrice modèle pour les normales
         Normal = mat3(transpose(inverse(Model))) * aNormal;
+        TexCoord = aTexCoord;
     }
 )";
 
@@ -1002,37 +1086,32 @@ int main() {
     #version 330 core
     in vec3 FragPos;
     in vec3 Normal;
-    
+    in vec2 TexCoord;
     out vec4 FragColor;
     
     // Paramètres d'éclairage
     uniform vec3 lightPos;
     uniform vec3 viewPos;
     uniform vec3 lightColor;
-    uniform vec3 objectColor;
+
     uniform float ambientStrength;
     uniform float specularStrength;
     uniform float shininess;
-    
+    uniform sampler2D texture1;
     void main() {
-        // Composante ambiante
-        vec3 ambient = ambientStrength * lightColor;
-        
-        // Composante diffuse
-        vec3 norm = normalize(Normal);
-        vec3 lightDir = normalize(lightPos - FragPos);
-        float diff = max(dot(norm, lightDir), 0.0);
-        vec3 diffuse = diff * lightColor;
-        
-        // Composante spéculaire
-        vec3 viewDir = normalize(viewPos - FragPos);
-        vec3 reflectDir = reflect(-lightDir, norm);
-        float spec = pow(max(dot(viewDir, reflectDir), 0.0), shininess);
-        vec3 specular = specularStrength * spec * lightColor;
-        
-        // Combinaison des composantes
-        vec3 result = (ambient + diffuse + specular) * objectColor;
-        FragColor = vec4(result, 1.0);
+               vec3 texColor = texture(texture1, TexCoord).rgb;
+               vec3 ambient = ambientStrength * lightColor * texColor;
+            vec3 norm = normalize(Normal);
+            vec3 lightDir = normalize(lightPos - FragPos);
+            float diff = max(dot(norm, lightDir), 0.0);
+            vec3 diffuse = diff * lightColor * texColor;
+            vec3 viewDir = normalize(viewPos - FragPos);
+            vec3 reflectDir = reflect(-lightDir, norm);
+            float spec = pow(max(dot(viewDir, reflectDir), 0.0), shininess);
+            vec3 specular = specularStrength * spec * lightColor;
+
+            vec3 result = ambient + diffuse + specular;
+            FragColor = vec4(result, 1.0);
     }
 )";
 
@@ -1049,7 +1128,7 @@ int main() {
     // Boucle de rendu
     while (!glfwWindowShouldClose(window)) {
         // Effacer les buffers de couleur et de profondeur
-        glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         processInput();
         if (poseFound == false) {
@@ -1063,9 +1142,10 @@ int main() {
            
         }
         else {
-            glm::mat4 invView = glm::inverse(newview);
-            cameraPos = glm::vec3(invView[3]);
-			cameraPos = -cameraPos;
+            glm::vec4 pos4(cameraPos, 1.0f);
+            glm::vec4 invView =pos4*newview;
+            cameraPos = glm::vec3(0,0,0)-glm::vec3(invView[3]);
+			
         }
         view = glm::lookAt(cameraPos, cameraTarget, glm::vec3(0.0f, 1.0f, 0.0f));
         
@@ -1089,7 +1169,9 @@ int main() {
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "Model"), 1, GL_FALSE, &Model[0][0]);
-
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, textureID);
+        glUniform1i(glGetUniformLocation(shaderProgram, "texture1"), 1);
 
         // Passer les paramètres d'éclairage au shader
         glUniform3fv(glGetUniformLocation(shaderProgram, "lightPos"), 1, glm::value_ptr(lightPos));
@@ -1117,6 +1199,7 @@ int main() {
     glDeleteBuffers(1, &overlayVBO);
     glDeleteBuffers(1, &overlayEBO);
     glDeleteBuffers(1, &normalVBO);
+    glDeleteBuffers(1, &texCoordVBO);
     glDeleteProgram(overlayShaderProgram);
 
     glfwDestroyWindow(window);
