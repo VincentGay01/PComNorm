@@ -22,6 +22,7 @@ std::vector<float> texCoords;
 std::vector<float> normals;
 std::vector<int> texNumbers;
 std::vector<std::string> textureFiles;
+cv::Mat rvec, tvec;
 bool poseFound = false;
 bool modelbool = false;
 // Variables globales pour la caméra
@@ -152,6 +153,10 @@ GLuint createShaderProgram(const char* vertexSource, const char* fragmentSource)
 
     return shaderProgram;
 }
+
+
+
+
 
 bool loadPLY(const std::string& filename, std::vector<float>& vertices, std::vector<unsigned int>& indices,
     std::vector<float>& normals, std::vector<float>& texCoords, std::vector<int>& texNumbers,
@@ -371,6 +376,129 @@ bool loadPLY(const std::string& filename, std::vector<float>& vertices, std::vec
     // Si le fichier ne contient pas de coordonnées de texture, initialiser avec des valeurs par défaut
     if (!hasTexCoords && !hasTexCoordList) {
         texCoords.resize(positions.size() * 2, 0.0f);
+    }
+
+    return true;
+}
+
+
+bool loadPLY_clean(const std::string& filename,
+    std::vector<float>& vertices,
+    std::vector<unsigned int>& indices,
+    std::vector<float>& normals,
+    std::vector<float>& texCoords,
+    std::vector<std::string>& textureFiles) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Erreur : Impossible d'ouvrir le fichier " << filename << std::endl;
+        return false;
+    }
+
+    std::string line;
+    bool headerEnded = false;
+    int vertexCount = 0, faceCount = 0;
+    bool hasNormals = false;
+    bool hasTexCoordList = false;
+
+    // Temporaire pour lire les sommets et normales
+    std::vector<glm::vec3> tempPositions;
+    std::vector<glm::vec3> tempNormals;
+
+    // Lire header
+    while (std::getline(file, line)) {
+        if (line == "end_header") {
+            headerEnded = true;
+            break;
+        }
+        std::istringstream iss(line);
+        std::string word;
+        iss >> word;
+        if (word == "element") {
+            std::string type;
+            int count;
+            iss >> type >> count;
+            if (type == "vertex") vertexCount = count;
+            if (type == "face") faceCount = count;
+        }
+        else if (word == "property" && line.find("nx") != std::string::npos) {
+            hasNormals = true;
+        }
+        else if (word == "property list" && line.find("texcoord") != std::string::npos) {
+            hasTexCoordList = true;
+        }
+        else if (word == "comment" && line.find("TextureFile") != std::string::npos) {
+            size_t pos = line.find("TextureFile");
+            if (pos != std::string::npos) {
+                std::string texturePath = line.substr(pos + 11);
+                texturePath.erase(0, texturePath.find_first_not_of(" \t"));
+                texturePath.erase(texturePath.find_last_not_of(" \t") + 1);
+                textureFiles.push_back(texturePath);
+            }
+        }
+    }
+
+    if (!headerEnded) {
+        std::cerr << "Erreur : fin de header non trouvée" << std::endl;
+        return false;
+    }
+
+    // Lire les vertices
+    for (int i = 0; i < vertexCount; ++i) {
+        std::getline(file, line);
+        std::istringstream iss(line);
+        float x, y, z, nx = 0.0f, ny = 0.0f, nz = 0.0f;
+        iss >> x >> y >> z;
+        if (hasNormals) {
+            iss >> nx >> ny >> nz;
+        }
+        tempPositions.emplace_back(x, y, z);
+        tempNormals.emplace_back(nx, ny, nz);
+    }
+
+    // Lire les faces avec texcoord list
+    for (int i = 0; i < faceCount; ++i) {
+        std::getline(file, line);
+        std::istringstream iss(line);
+
+        int nVerts;
+        iss >> nVerts;
+        if (nVerts != 3) continue; // on ignore les non-triangles
+
+        int i0, i1, i2;
+        iss >> i0 >> i1 >> i2;
+
+        int texCoordCount;
+        iss >> texCoordCount;
+
+        std::vector<float> tex;
+        for (int j = 0; j < texCoordCount; ++j) {
+            float val;
+            iss >> val;
+            tex.push_back(val);
+        }
+
+        // Chaque triangle → 3 sommets (non partagés)
+        glm::ivec3 ids = { i0, i1, i2 };
+
+        for (int j = 0; j < 3; ++j) {
+            glm::vec3 pos = tempPositions[ids[j]];
+            glm::vec3 norm = tempNormals[ids[j]];
+            float u = tex[j * 2];
+            float v = tex[j * 2 + 1];
+
+            vertices.push_back(pos.x);
+            vertices.push_back(pos.y);
+            vertices.push_back(pos.z);
+
+            normals.push_back(norm.x);
+            normals.push_back(norm.y);
+            normals.push_back(norm.z);
+
+            texCoords.push_back(u);
+            texCoords.push_back(1.0f - v);
+
+            indices.push_back(indices.size());
+        }
     }
 
     return true;
@@ -724,6 +852,65 @@ cv::Mat renderMeshToImage(const std::vector<float>& vertices,
 
 
 
+void alignByContoursRANSAC(const cv::Mat& img1, const cv::Mat& img2) {
+    // 1. Détection de bords (Canny)
+    cv::Mat edges1, edges2;
+    cv::Canny(img1, edges1, 100, 200);
+    cv::Canny(img2, edges2, 100, 200);
+
+    // 2. Trouver les contours
+    std::vector<std::vector<cv::Point>> contours1, contours2;
+    cv::findContours(edges1, contours1, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    cv::findContours(edges2, contours2, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    // 3. Fusionner tous les points de contours en un seul nuage de points
+    std::vector<cv::Point> points1, points2;
+    for (auto& contour : contours1) points1.insert(points1.end(), contour.begin(), contour.end());
+    for (auto& contour : contours2) points2.insert(points2.end(), contour.begin(), contour.end());
+
+    // 4. Downsampling (on prend 1 point sur N pour accélérer)
+    const int sampleRate = 10;
+    std::vector<cv::Point2f> sampled1, sampled2;
+    for (size_t i = 0; i < points1.size(); i += sampleRate) sampled1.push_back(points1[i]);
+    for (size_t i = 0; i < points2.size(); i += sampleRate) sampled2.push_back(points2[i]);
+
+    // 5. Matching naïf basé sur la distance (greedy matching)
+    std::vector<cv::Point2f> matched1, matched2;
+    for (auto& p1 : sampled1) {
+        double minDist = 1e9;
+        cv::Point2f bestMatch;
+        for (auto& p2 : sampled2) {
+            double dist = cv::norm(p1 - p2);
+            if (dist < minDist) {
+                minDist = dist;
+                bestMatch = p2;
+            }
+        }
+        matched1.push_back(p1);
+        matched2.push_back(bestMatch);
+    }
+
+    // 6. Estimer la transformation avec RANSAC
+    cv::Mat inlierMask;
+    cv::Mat affine = cv::estimateAffinePartial2D(matched1, matched2, inlierMask, cv::RANSAC);
+
+    if (affine.empty()) {
+        std::cerr << "Erreur : pas de transformation trouvée !" << std::endl;
+        return;
+    }
+
+    // 7. Appliquer la transformation
+    cv::Mat aligned;
+    cv::warpAffine(img1, aligned, affine, img2.size());
+
+    // 8. Afficher les résultats
+    cv::imwrite("Image 1 (Originale)", img1);
+    cv::imwrite("Image 2 (Reference)", img2);
+    cv::imwrite("Image 1 alignée", aligned);
+
+    cv::waitKey(0);
+}
+
 // Fonction modifiée pour prendre en compte les matrices de vue et de projection actuelles
 bool alignMeshWithImage(const char* imagePath,
     const std::vector<float>& vertices,
@@ -747,12 +934,19 @@ bool alignMeshWithImage(const char* imagePath,
         shaderProgram,textureID ,view, projection, model,
         referenceImage.cols, referenceImage.rows);
 
+	
     // Optionnel: Sauvegarder les images pour débogage
     cv::imwrite("reference_image.png", referenceImage);
     cv::imwrite("mesh_rendering.png", meshRendering);
 
     // 3. Détecter des points caractéristiques dans les deux images
-    cv::Ptr<cv::Feature2D> detector = cv::SIFT::create();
+    cv::Ptr<cv::Feature2D> detector = cv::SIFT::create(
+        20000,        // Nombre de keypoints maximum (par image)
+        5,    // Nombre de couches par octave
+        0.09,// Seuil de contraste (rejette points peu significatifs)
+        20,    // Seuil pour éliminer les points près des bords
+        1.2             // Écart-type du flou gaussien appliqué en entrée
+    );
     std::vector<cv::KeyPoint> keypointsRef, keypointsMesh;
     cv::Mat descriptorsRef, descriptorsMesh;
     
@@ -805,10 +999,46 @@ bool alignMeshWithImage(const char* imagePath,
         }
     }
 
-    std::cout << "Nombre de bonnes correspondances trouvées: " << goodMatches.size() << std::endl;
+    // 6. Filtrer pour garantir une correspondance unique
+       // Pour chaque keypoint, ne conserver que la meilleure correspondance
+    std::map<int, cv::DMatch> bestMatchForRefKeypoint;    // queryIdx -> meilleur match
+    std::map<int, cv::DMatch> bestMatchForMeshKeypoint;   // trainIdx -> meilleur match
 
-    if (goodMatches.size() < 8) {
-        std::cerr << "Pas assez de bonnes correspondances trouvées (minimum 8 requises)" << std::endl;
+    // Trouver les meilleures correspondances pour chaque keypoint (dans les deux directions)
+
+    for (const auto& match : goodMatches) {
+        // Pour les keypoints de référence
+        auto refIt = bestMatchForRefKeypoint.find(match.queryIdx);
+        if (refIt == bestMatchForRefKeypoint.end() || match.distance < refIt->second.distance) {
+            bestMatchForRefKeypoint[match.queryIdx] = match;
+        }
+
+        // Pour les keypoints du maillage
+        auto meshIt = bestMatchForMeshKeypoint.find(match.trainIdx);
+        if (meshIt == bestMatchForMeshKeypoint.end() || match.distance < meshIt->second.distance) {
+            bestMatchForMeshKeypoint[match.trainIdx] = match;
+        }
+    }
+
+    // Garder uniquement les correspondances mutuelles (un keypoint de l'image 1 est associé à un keypoint 
+    // de l'image 2 et vice versa)
+    std::vector<cv::DMatch> uniqueMatches;
+    for (const auto& pair : bestMatchForRefKeypoint) {
+        const cv::DMatch& match = pair.second;
+        auto it = bestMatchForMeshKeypoint.find(match.trainIdx);
+
+        // Vérifier si cette correspondance est mutuelle
+        if (it != bestMatchForMeshKeypoint.end() &&
+            it->second.queryIdx == match.queryIdx) {
+            uniqueMatches.push_back(match);
+        }
+    }
+
+    std::cout << "Nombre de correspondances initiales: " << goodMatches.size() << std::endl;
+    std::cout << "Nombre de correspondances uniques: " << uniqueMatches.size() << std::endl;
+
+    if (uniqueMatches.size() < 8) {
+        std::cerr << "Pas assez de bonnes correspondances uniques trouvées (minimum 8 requises)" << std::endl;
         return false;
     }
 
@@ -840,7 +1070,7 @@ bool alignMeshWithImage(const char* imagePath,
         2252.308217738484, 0, 1352.0,
         0, 2252.308217738484, 900.0,
         0, 0, 1);
-    cv::Mat rvec, tvec;
+  
     
     //  Appeler la fonction
     poseFound = estimateCameraPoseFromMatches(matchedPoints, cameraMatrix, rvec, tvec);
@@ -862,22 +1092,22 @@ bool alignMeshWithImage(const char* imagePath,
 	// 5. Afficher les correspondances
     cv::Mat imgMatches;
     cv::drawMatches(referenceImage, keypointsRef, meshRendering, keypointsMesh,
-        goodMatches, imgMatches, cv::Scalar::all(-1),
+        uniqueMatches, imgMatches, cv::Scalar::all(-1),
         cv::Scalar::all(-1), std::vector<char>(),
         cv::DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS);
     cv::imwrite("matches.png", imgMatches);
 
     // 6. Extraire les points correspondants
     std::vector<cv::Point2f> pointsRef, pointsMesh;
-    for (size_t i = 0; i < goodMatches.size(); i++) {
-        pointsRef.push_back(keypointsRef[goodMatches[i].queryIdx].pt);
-        pointsMesh.push_back(keypointsMesh[goodMatches[i].trainIdx].pt);
+    for (size_t i = 0; i < uniqueMatches.size(); i++) {
+        pointsRef.push_back(keypointsRef[uniqueMatches[i].queryIdx].pt);
+        pointsMesh.push_back(keypointsMesh[uniqueMatches[i].trainIdx].pt);
     }
     return true;
 }
 
 
-float overlayScale = 0.8f;
+
 
 
 // Modification de la fonction processInput pour utiliser la vue de caméra actuelle
@@ -972,11 +1202,14 @@ int main() {
 
     // Activer le test de profondeur
     glEnable(GL_DEPTH_TEST);
-    
+    /*
     if (!loadPLY("D:/project/PComNorm/Chemi-AU-O0051.ply", vertices, indices, normals, texCoords, texNumbers, textureFiles)) {
         return -1;
     }
-
+    */
+    if (!loadPLY_clean("D:/project/PComNorm/Chemi-AU-O0052.ply", vertices, indices, normals, texCoords, textureFiles)) {
+        return -1;
+    }
 
     // Création du VAO, VBO et EBO avec support pour les normales
     GLuint VAO, VBO, normalVBO, EBO;
@@ -1111,7 +1344,8 @@ int main() {
             vec3 specular = specularStrength * spec * lightColor;
 
             vec3 result = ambient + diffuse + specular;
-            FragColor = vec4(result, 1.0);
+           // FragColor = vec4(result, 1.0);
+            FragColor = vec4(texture(texture1, TexCoord).rgb, 1.0);
     }
 )";
 
@@ -1125,27 +1359,29 @@ int main() {
     float specularStrength = 0.5f;
     float shininess = 32.0f;
 
+    bool succ=false;
     // Boucle de rendu
     while (!glfwWindowShouldClose(window)) {
         // Effacer les buffers de couleur et de profondeur
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         processInput();
-        if (poseFound == false) {
-            cameraPos = glm::vec3(
-                cameraDistance * sin(glm::radians(cameraAngleY)) * cos(glm::radians(cameraAngleX)),
-                cameraDistance * sin(glm::radians(cameraAngleX)),
-                cameraDistance * cos(glm::radians(cameraAngleY)) * cos(glm::radians(cameraAngleX))
-            );
+        if (succ == false) 
+        {
+            if (poseFound == false) {
+                cameraPos = glm::vec3(
+                    cameraDistance * sin(glm::radians(cameraAngleY)) * cos(glm::radians(cameraAngleX)),
+                    cameraDistance * sin(glm::radians(cameraAngleX)),
+                    cameraDistance * cos(glm::radians(cameraAngleY)) * cos(glm::radians(cameraAngleX))
+                );
 
-            cameraPos += cameraTarget;
-           
-        }
-        else {
-            glm::vec4 pos4(cameraPos, 1.0f);
-            glm::vec4 invView =pos4*newview;
-            cameraPos = glm::vec3(0,0,0)-glm::vec3(invView[3]);
-			
+                cameraPos += cameraTarget;
+
+            }
+            else {
+                cameraPos = newview * glm::vec4(cameraPos, 1);
+				succ = true;
+            }
         }
         view = glm::lookAt(cameraPos, cameraTarget, glm::vec3(0.0f, 1.0f, 0.0f));
         
@@ -1169,9 +1405,9 @@ int main() {
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, glm::value_ptr(view));
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, glm::value_ptr(projection));
         glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "Model"), 1, GL_FALSE, &Model[0][0]);
-        glActiveTexture(GL_TEXTURE1);
+        glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, textureID);
-        glUniform1i(glGetUniformLocation(shaderProgram, "texture1"), 1);
+        glUniform1i(glGetUniformLocation(shaderProgram, "texture1"), 0);
 
         // Passer les paramètres d'éclairage au shader
         glUniform3fv(glGetUniformLocation(shaderProgram, "lightPos"), 1, glm::value_ptr(lightPos));
