@@ -25,6 +25,8 @@ std::vector<std::string> textureFiles;
 cv::Mat rvec, tvec;
 bool poseFound = false;
 bool modelbool = false;
+int level;
+float scoredist;
 // Variables globales pour la caméra
 float objectRotationX = 0.0f;
 float objectRotationY = 0.0f;
@@ -625,209 +627,53 @@ cv::Mat renderMeshToImage(const std::vector<float>& vertices,
 
 
 
-// Fonction modifiée pour prendre en compte les matrices de vue et de projection actuelles
-bool alignMeshWithImage(const char* imagePath,
-    const std::vector<float>& vertices,
-    const std::vector<unsigned int>& indices,
-    const std::vector<float>& normals, // Ajout des normales
-    GLuint shaderProgram,
-     glm::mat4& view,
-    const glm::mat4& projection,
-    const glm::mat4& model,
-    glm::mat4& outModelMatrix) {
-
-    // 1. Charger l'image de référence
-    cv::Mat referenceImage = cv::imread(imagePath, cv::IMREAD_COLOR);
-    if (referenceImage.empty()) {
-        std::cerr << "Erreur: Impossible de charger l'image de référence: " << imagePath << std::endl;
-        return false;
-    }
-
-    // 2. Préparer une image de rendu du maillage 3D avec la vue de caméra actuelle
-    cv::Mat meshRendering = renderMeshToImage(vertices, indices, normals, texCoords,
-        shaderProgram,textureID ,view, projection, model,
-        referenceImage.cols, referenceImage.rows);
-
-    cv::Mat gray1, gray2;
-
-    cv::cvtColor(referenceImage, gray1, cv::COLOR_BGR2GRAY);
-    cv::cvtColor(meshRendering, gray2, cv::COLOR_BGR2GRAY);
-	
-    // Égalisation d'histogramme pour améliorer le contraste
-    cv::equalizeHist(gray1, gray1);
-    cv::equalizeHist(gray2, gray2);
-
-
-    // Optionnel: Sauvegarder les images pour débogage
-    cv::imwrite("reference_image.png",gray1);
-    cv::imwrite("mesh_rendering.png", gray2);
-
-    // Utiliser des paramètres AKAZE plus sûrs
-    cv::Ptr<cv::AKAZE> akaze = cv::AKAZE::create(
-        cv::AKAZE::DESCRIPTOR_MLDB,
-        128,                  // Taille par défaut
-        3,                  // Canaux
-        0.001f,            // Seuil plus bas
-        4,                  // Octaves
-        4,                  // Couches par octave
-        cv::KAZE::DIFF_PM_G2
-    );
-    std::vector<cv::KeyPoint> keypointsRef, keypointsMesh;
-    cv::Mat descriptorsRef, descriptorsMesh;
-  
-    akaze->detectAndCompute(gray1, cv::noArray(), keypointsRef, descriptorsRef);
-    akaze->detectAndCompute(gray2, cv::noArray(), keypointsMesh, descriptorsMesh);
-
-    // Vérifier si des points caractéristiques ont été trouvés
-    if (keypointsRef.empty() || keypointsMesh.empty()) {
-        std::cerr << "Erreur: Aucun point caractéristique détecté dans les images" << std::endl;
-        return false;
-    }
-
-    if (descriptorsRef.empty() || descriptorsMesh.empty()) {
-        std::cerr << "Erreur: Pas de descripteurs générés pour les points caractéristiques" << std::endl;
-        return false;
-    }
-
-    std::cout << "Points caractéristiques détectés: " << keypointsRef.size()
-        << " dans l'image de référence, " << keypointsMesh.size()
-        << " dans le rendu du maillage." << std::endl;
-
-
-    // 4. Matcher les points caractéristiques
-    cv::BFMatcher matcher(cv::NORM_HAMMING);
-    std::vector<std::vector<cv::DMatch>> knnMatches;
-    matcher.knnMatch(descriptorsRef, descriptorsMesh, knnMatches, 2);
-
-
-
-    // 5. Filtrer les correspondances de bonne qualité
-    const float ratioThresh = 0.5f;
-    std::vector<cv::DMatch> goodMatches;
-    for (size_t i = 0; i < knnMatches.size(); i++) {
-        if (knnMatches[i].size() < 2) continue; // Ignorer les matchs incomplets
-
-        if (knnMatches[i][0].distance < ratioThresh * knnMatches[i][1].distance) {
-            goodMatches.push_back(knnMatches[i][0]);
-        }
-    }
-
-    cv::Mat debugimage2 = referenceImage.clone();
-    for (const auto& m : keypointsRef) {
-        cv::circle(debugimage2, m.pt, 4, cv::Scalar(0, 255, 0), -1);
-    }
-    cv::imwrite("debug_matched_points2.png", debugimage2);
-
-
-    // 6. Filtrer pour garantir une correspondance unique
-       // Pour chaque keypoint, ne conserver que la meilleure correspondance
-    std::map<int, cv::DMatch> bestMatchForRefKeypoint;    // queryIdx -> meilleur match
-    std::map<int, cv::DMatch> bestMatchForMeshKeypoint;   // trainIdx -> meilleur match
-
-    // Trouver les meilleures correspondances pour chaque keypoint (dans les deux directions)
-
-    for (const auto& match : goodMatches) {
-        // Pour les keypoints de référence
-        auto refIt = bestMatchForRefKeypoint.find(match.queryIdx);
-        if (refIt == bestMatchForRefKeypoint.end() || match.distance < refIt->second.distance) {
-            bestMatchForRefKeypoint[match.queryIdx] = match;
-        }
-
-        // Pour les keypoints du maillage
-        auto meshIt = bestMatchForMeshKeypoint.find(match.trainIdx);
-        if (meshIt == bestMatchForMeshKeypoint.end() || match.distance < meshIt->second.distance) {
-            bestMatchForMeshKeypoint[match.trainIdx] = match;
-        }
-    }
-
-    // Garder uniquement les correspondances mutuelles (un keypoint de l'image 1 est associé à un keypoint 
-    // de l'image 2 et vice versa)
-    std::vector<cv::DMatch> uniqueMatches;
-    for (const auto& pair : bestMatchForRefKeypoint) {
-        const cv::DMatch& match = pair.second;
-        auto it = bestMatchForMeshKeypoint.find(match.trainIdx);
-
-        // Vérifier si cette correspondance est mutuelle
-        if (it != bestMatchForMeshKeypoint.end() &&
-            it->second.queryIdx == match.queryIdx) {
-            uniqueMatches.push_back(match);
-        }
-    }
-
-    std::cout << "Nombre de correspondances initiales: " << goodMatches.size() << std::endl;
-    std::cout << "Nombre de correspondances uniques: " << uniqueMatches.size() << std::endl;
-
-    if (uniqueMatches.size() < 8) {
-        std::cerr << "Pas assez de bonnes correspondances uniques trouvées (minimum 8 requises)" << std::endl;
-        return false;
-    }
-
-	// fonction pour le calcul de la matrice MVP
-    int image_width = referenceImage.cols;
-    int image_height = referenceImage.rows;
-
-    // 1. Projetter les sommets sur l'image
-    glm::mat4 tempMVP = projection * view * model;
-    std::vector<cv::Point2f> projectedVertices = projectVerticesToImage(vertices, tempMVP, image_width, image_height);
-
-    // 2. Matcher les keypoints détectés sur l'image du mesh
-    std::vector<std::pair<cv::Point2f, glm::vec3>> matchedPoints = matchKeypointsTo3D(keypointsMesh, projectedVertices, vertices);
-
-    // 3. Utiliser les correspondances
-    cv::Mat debugImage = meshRendering.clone();
-    for (const auto& m : matchedPoints) {
-        cv::circle(debugImage, m.first, 4, cv::Scalar(0, 255, 0), -1);
-    }
-    cv::imwrite("debug_matched_points.png", debugImage);
-
-	
-
-    for (const auto& match : matchedPoints) {
-        const cv::Point2f& keypoint2D = match.first;
-        const glm::vec3& point3D = match.second;
-    }
-
-    //-----------------------------------------------------------------------------
-
-    cv::Mat cameraMatrix = (cv::Mat_<double>(3, 3) <<
-        2252.308217738484, 0, 1352.0,
-        0, 2252.308217738484, 900.0,
-        0, 0, 1);
-  
-    
-    //  Appeler la fonction
-    poseFound = estimateCameraPoseFromMatches(matchedPoints, cameraMatrix, rvec, tvec);
-
-    if (poseFound) {
-        std::cout << "Rotation (Rodrigues) : " << rvec.t() << std::endl;
-        std::cout << "Translation : " << tvec.t() << std::endl;
-
-        // Optionnel : convertir rvec en matrice de rotation
-        cv::Mat R;
-        cv::Rodrigues(rvec, R);
-        std::cout << "Rotation matrix : " << R << std::endl;
-        
-            newview = createViewMatrixFromPnP(rvec, tvec);
-
-    }
-
-    //-------------------------------------------------------------------
-	// 5. Afficher les correspondances
+// Ajouter cette fonction dans votre code pour visualiser les correspondances
+void visualizeMatches(
+    const cv::Mat& refImage,
+    const cv::Mat& testImage,
+    const std::vector<cv::KeyPoint>& kpRef,
+    const std::vector<cv::KeyPoint>& kpTest,
+    const std::vector<cv::DMatch>& goodMatches,
+    const std::string& windowName,
+    const std::string& outputPath = "")
+{
+    // Créer une image pour visualiser les correspondances
     cv::Mat imgMatches;
-    cv::drawMatches(referenceImage, keypointsRef, meshRendering, keypointsMesh,
-        uniqueMatches, imgMatches, cv::Scalar::all(-1),
-        cv::Scalar::all(-1), std::vector<char>(),
-        cv::DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS);
-    cv::imwrite("matches.png", imgMatches);
 
-    // 6. Extraire les points correspondants
-    std::vector<cv::Point2f> pointsRef, pointsMesh;
-    for (size_t i = 0; i < uniqueMatches.size(); i++) {
-        pointsRef.push_back(keypointsRef[uniqueMatches[i].queryIdx].pt);
-        pointsMesh.push_back(keypointsMesh[uniqueMatches[i].trainIdx].pt);
+    // Dessiner les correspondances
+    cv::drawMatches(
+        refImage,            // Image 1
+        kpRef,               // Keypoints de l'image 1
+        testImage,           // Image 2
+        kpTest,              // Keypoints de l'image 2
+        goodMatches,         // Correspondances à dessiner
+        imgMatches,          // Image de sortie
+        cv::Scalar(0, 255, 0),  // Couleur des lignes (vert)
+        cv::Scalar(255, 0, 0),  // Couleur des points (bleu)
+        std::vector<char>(), // Mask (vide = dessiner toutes les correspondances)
+        cv::DrawMatchesFlags::DEFAULT
+    );
+
+    // Ajouter des informations sur le nombre de correspondances
+    std::string text = "Matches: " + std::to_string(goodMatches.size());
+    cv::putText(
+        imgMatches,
+        text,
+        cv::Point(10, 30),
+        cv::FONT_HERSHEY_SIMPLEX,
+        1.0,
+        cv::Scalar(0, 0, 255),
+        2
+    );
+
+    // Optionnellement, sauvegarder l'image
+    if (!outputPath.empty()) {
+        cv::imwrite(outputPath, imgMatches);
     }
-    return true;
 }
+
+
+
 
 
 bool accumulateMatchesFromModelRotation(
@@ -841,13 +687,14 @@ bool accumulateMatchesFromModelRotation(
     const glm::mat4& projection,
     glm::mat4& modelBase,
     std::vector<std::pair<cv::Point2f, glm::vec3>>& globalMatches,
-    int nbAngles = 10)
+    int nbAngles = 10,
+    int maxKeypointsPerImage = 20)  // Paramètre pour contrôler le nombre de keypoints à garder par image
 {
     cv::Ptr<cv::AKAZE> akaze = cv::AKAZE::create(
         cv::AKAZE::DESCRIPTOR_MLDB,
-        128,                  // Taille par défaut
+        128,                // Taille par défaut
         3,                  // Canaux
-        0.005f,            // Seuil plus bas
+        0.005f,             // Seuil plus bas
         5,                  // Octaves
         4,                  // Couches par octave
         cv::KAZE::DIFF_PM_G2
@@ -861,40 +708,37 @@ bool accumulateMatchesFromModelRotation(
         std::cerr << "Erreur chargement image " << refImagePath << std::endl;
         return false;
     }
+
     cv::cvtColor(imageRef, grayRef, cv::COLOR_BGR2GRAY);
     akaze->detectAndCompute(grayRef, cv::noArray(), kpRef, descRef);
 
+    // Structure pour stocker les correspondances par angle avec un score de qualité
+    std::vector<std::pair<float, std::vector<std::pair<cv::Point2f, glm::vec3>>>> matchesByAngle;
+
     for (int i = 0; i < nbAngles; ++i) {
         float angleY = glm::radians((360.0f / nbAngles) * i);
-
         // Rotation du modèle
         glm::mat4 model = glm::rotate(modelBase, angleY, glm::vec3(0, 1, 0));
-        glm::vec3 camPos =cameraPos;
-        glm::mat4 view = glm::lookAt(camPos,cameraTarget, glm::vec3(0, 1, 0));
+        glm::vec3 camPos = glm::vec3(0,0,0.25);
+        glm::mat4 view = glm::lookAt(camPos, cameraTarget, glm::vec3(0, 1, 0));
 
         // Rendu
         cv::Mat meshImage = renderMeshToImage(vertices, indices, normals, texCoords,
             shaderProgram, textureID, view, projection, model,
             imageRef.cols, imageRef.rows);
 
-		std::string inb = std::to_string(i);
+        std::string inb = std::to_string(i);
         if (meshImage.empty()) continue;
 
         // Feature matching
         cv::Mat grayMesh;
-        cv::cvtColor(imageRef, grayRef, cv::COLOR_BGR2GRAY);
         cv::cvtColor(meshImage, grayMesh, cv::COLOR_BGR2GRAY);
-        cv::equalizeHist(grayRef, grayRef);
         cv::equalizeHist(grayMesh, grayMesh);
 
-       
-        std::vector<cv::KeyPoint>  kpMesh;
-        cv::Mat  descMesh;
-        
+        std::vector<cv::KeyPoint> kpMesh;
+        cv::Mat descMesh;
+
         akaze->detectAndCompute(grayMesh, cv::noArray(), kpMesh, descMesh);
-
-
-      
 
         if (kpRef.empty() || kpMesh.empty() || descRef.empty() || descMesh.empty()) continue;
 
@@ -902,27 +746,107 @@ bool accumulateMatchesFromModelRotation(
         std::vector<std::vector<cv::DMatch>> knnMatches;
         matcher.knnMatch(descRef, descMesh, knnMatches, 2);
 
+        // Sélectionner les bonnes correspondances avec le ratio de Lowe
         std::vector<cv::DMatch> goodMatches;
         for (auto& m : knnMatches) {
-            if (m.size() >= 2 && m[0].distance < 0.6f * m[1].distance)
+            if (m.size() >= 2 && m[0].distance < 0.7f * m[1].distance)
                 goodMatches.push_back(m[0]);
         }
 
-        cv::Mat debugImage = meshImage.clone();
-        for (const auto& m : kpMesh) {
-            cv::circle(debugImage, m.pt, 4, cv::Scalar(0, 255, 0), -1);
-        }
-        cv::imwrite("meshImage" + inb + ".png", debugImage);
+        std::string matchImagePath = "matches_angle" + inb + ".png";
+        visualizeMatches(
+            imageRef,
+            meshImage,
+            kpRef,
+            kpMesh,
+            goodMatches,
+            "Correspondances pour l'angle " + inb,
+            matchImagePath
+        );
+
+        // Projeter les vertices 3D sur l'image 2D
         glm::mat4 MVP = projection * view * model;
         auto projectedVerts = projectVerticesToImage(vertices, MVP, imageRef.cols, imageRef.rows);
+
+        // Récupérer les correspondances 2D-3D
         auto matchedPoints = matchKeypointsTo3D(kpMesh, projectedVerts, vertices);
 
-        std::cout << "[Angle " << i << "] correspondances valides : " << matchedPoints.size() << std::endl;
+        // Maintenant, évaluons la qualité des correspondances
+        if (matchedPoints.size() > 0) {
+            // Structure pour stocker chaque correspondance avec un score
+            std::vector<std::tuple<float, cv::Point2f, glm::vec3>> scoredMatches;
 
-        globalMatches.insert(globalMatches.end(), matchedPoints.begin(), matchedPoints.end());
+            // Calculer un score pour chaque correspondance
+            // Le score peut être basé sur différents critères comme:
+            // - La distance dans l'espace des caractéristiques
+            // - La confiance de détection du keypoint
+            // - La distance à la projection attendue
+            for (size_t j = 0; j < matchedPoints.size(); ++j) {
+                const auto& match = matchedPoints[j];
+
+                // Exemple de score: calculer la distance euclidienne entre le point 2D et sa projection prévue
+                // Vous pouvez remplacer cela par une meilleure métrique adaptée à votre problème
+                float score = 0.0f;
+                for (const auto& goodMatch : goodMatches) {
+                    if (kpMesh[goodMatch.trainIdx].pt == match.first) {
+                        score = goodMatch.distance;  // Plus petit = meilleur
+                        break;
+                    }
+                }
+
+                scoredMatches.emplace_back(score, match.first, match.second);
+            }
+
+          
+
+            // Trier les correspondances par score (du meilleur au pire)
+            std::sort(scoredMatches.begin(), scoredMatches.end(),
+                [](const auto& a, const auto& b) {
+                    return std::get<0>(a) < std::get<0>(b);  // Tri ascendant car distance plus petite = meilleure
+                });
+
+            // Conserver uniquement les meilleures correspondances
+            std::vector<std::pair<cv::Point2f, glm::vec3>> bestMatches;
+            int numToKeep = std::min(maxKeypointsPerImage, static_cast<int>(scoredMatches.size()));
+
+            for (int j = 0; j < numToKeep; ++j) {
+                bestMatches.emplace_back(std::get<1>(scoredMatches[j]), std::get<2>(scoredMatches[j]));
+            }
+
+            // Calculer un score global pour cette vue/angle
+            // Par exemple, la moyenne des scores des meilleures correspondances
+            float viewScore = 0.0f;
+            for (int j = 0; j < numToKeep; ++j) {
+                viewScore += std::get<0>(scoredMatches[j]);
+            }
+            
+            viewScore /= numToKeep;  // Score moyen
+            if (viewScore > scoredist)
+            {
+                scoredist = viewScore;
+                level = i;
+            }
+                
+            std::cout << "[Angle " << i << "] Correspondances sélectionnées: " << bestMatches.size()
+                << " (score: " << viewScore << ")" << std::endl;
+
+            // Stocker les meilleures correspondances pour cette vue avec leur score global
+            matchesByAngle.emplace_back(viewScore, bestMatches);
+        }
     }
 
-    return globalMatches.size() >= 4;
+    // Trier les vues par score (du meilleur au pire)
+    std::sort(matchesByAngle.begin(), matchesByAngle.end(),
+        [](const auto& a, const auto& b) {
+            return a.first < b.first;  // Tri ascendant car distance plus petite = meilleure
+        });
+
+    // Ajouter les correspondances à l'ensemble global
+    for (const auto& viewMatches : matchesByAngle) {
+        globalMatches.insert(globalMatches.end(), viewMatches.second.begin(), viewMatches.second.end());
+    }
+
+    return globalMatches.size() >= 4;  // Minimum requis pour PnP
 }
 
 
@@ -959,7 +883,8 @@ void processInput() {
             shaderProgram, textureID,
             projection, Model,
             globalMatches,
-            20)) // 12 angles (tous les 30°)
+            30,
+            500)) 
         {
             cv::Mat cameraMatrix = (cv::Mat_<double>(3, 3) <<
                 2252.308217738484, 0, 1352.0,
