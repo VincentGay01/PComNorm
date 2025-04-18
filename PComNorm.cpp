@@ -676,7 +676,7 @@ void visualizeMatches(
 
 
 
-bool accumulateMatchesFromModelRotation(
+bool accumulateMatchesFromMultiAxisRotation(
     const std::string& refImagePath,
     const std::vector<float>& vertices,
     const std::vector<unsigned int>& indices,
@@ -687,8 +687,9 @@ bool accumulateMatchesFromModelRotation(
     const glm::mat4& projection,
     glm::mat4& modelBase,
     std::vector<std::pair<cv::Point2f, glm::vec3>>& globalMatches,
-    int nbAngles = 10,
-    int maxKeypointsPerImage = 20)  // Paramètre pour contrôler le nombre de keypoints à garder par image
+    int primaryAngles = 10,    // Nombre d'angles pour la rotation primaire (axe Y)
+    int secondaryAngles = 5,   // Nombre d'angles pour les rotations secondaires (axes X et Z)
+    int maxKeypointsPerImage = 20)
 {
     cv::Ptr<cv::AKAZE> akaze = cv::AKAZE::create(
         cv::AKAZE::DESCRIPTOR_MLDB,
@@ -700,6 +701,8 @@ bool accumulateMatchesFromModelRotation(
         cv::KAZE::DIFF_PM_G2
     );
 
+
+
     cv::Mat grayRef;
     std::vector<cv::KeyPoint> kpRef;
     cv::Mat descRef;
@@ -708,18 +711,40 @@ bool accumulateMatchesFromModelRotation(
         std::cerr << "Erreur chargement image " << refImagePath << std::endl;
         return false;
     }
+    cv::Mat refProcessed;
+    imageRef.copyTo(refProcessed);
+
 
     cv::cvtColor(imageRef, grayRef, cv::COLOR_BGR2GRAY);
-    akaze->detectAndCompute(grayRef, cv::noArray(), kpRef, descRef);
+
+    // Amélioration du contraste avec CLAHE
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(2.0, cv::Size(8, 8));
+    cv::Mat enhancedRef;
+    clahe->apply(grayRef, enhancedRef);
+
+    // Augmentation de la netteté
+    cv::Mat sharpenedRef;
+    cv::Mat kernel = (cv::Mat_<float>(3, 3) <<
+        0, -1, 0,
+        -1, 5, -1,
+        0, -1, 0);
+    cv::filter2D(enhancedRef, sharpenedRef, -1, kernel);
+
+    akaze->detectAndCompute(sharpenedRef, cv::noArray(), kpRef, descRef);
 
     // Structure pour stocker les correspondances par angle avec un score de qualité
-    std::vector<std::pair<float, std::vector<std::pair<cv::Point2f, glm::vec3>>>> matchesByAngle;
+    std::vector<std::tuple<float, glm::vec3, std::vector<std::pair<cv::Point2f, glm::vec3>>>> rotationResults;
 
-    for (int i = 0; i < nbAngles; ++i) {
-        float angleY = glm::radians((360.0f / nbAngles) * i);
-        // Rotation du modèle
+    // ÉTAPE 1: Rotation primaire sur l'axe Y
+    std::cout << "=== Rotation primaire sur l'axe Y ===" << std::endl;
+    float bestYAngle = 0.0f;
+    float bestYScore = std::numeric_limits<float>::max(); // Plus petit = meilleur pour les distances
+
+    for (int i = 0; i < primaryAngles; ++i) {
+        float angleY = glm::radians((360.0f / primaryAngles) * i);
+        // Rotation du modèle sur Y
         glm::mat4 model = glm::rotate(modelBase, angleY, glm::vec3(0, 1, 0));
-        glm::vec3 camPos = glm::vec3(0,0,0.25);
+        glm::vec3 camPos = cameraPos;
         glm::mat4 view = glm::lookAt(camPos, cameraTarget, glm::vec3(0, 1, 0));
 
         // Rendu
@@ -727,7 +752,7 @@ bool accumulateMatchesFromModelRotation(
             shaderProgram, textureID, view, projection, model,
             imageRef.cols, imageRef.rows);
 
-        std::string inb = std::to_string(i);
+        std::string inb = "Y_" + std::to_string(i);
         if (meshImage.empty()) continue;
 
         // Feature matching
@@ -749,19 +774,19 @@ bool accumulateMatchesFromModelRotation(
         // Sélectionner les bonnes correspondances avec le ratio de Lowe
         std::vector<cv::DMatch> goodMatches;
         for (auto& m : knnMatches) {
-            if (m.size() >= 2 && m[0].distance < 0.7f * m[1].distance)
+            if (m.size() >= 2 && m[0].distance < 0.6f * m[1].distance)
                 goodMatches.push_back(m[0]);
         }
 
-        std::string matchImagePath = "matches_angle" + inb + ".png";
+        // Visualiser les correspondances
         visualizeMatches(
             imageRef,
             meshImage,
             kpRef,
             kpMesh,
             goodMatches,
-            "Correspondances pour l'angle " + inb,
-            matchImagePath
+            "",  // Pas d'affichage de fenêtre
+            "matches_Y_" + std::to_string(i) + ".png"
         );
 
         // Projeter les vertices 3D sur l'image 2D
@@ -777,15 +802,9 @@ bool accumulateMatchesFromModelRotation(
             std::vector<std::tuple<float, cv::Point2f, glm::vec3>> scoredMatches;
 
             // Calculer un score pour chaque correspondance
-            // Le score peut être basé sur différents critères comme:
-            // - La distance dans l'espace des caractéristiques
-            // - La confiance de détection du keypoint
-            // - La distance à la projection attendue
             for (size_t j = 0; j < matchedPoints.size(); ++j) {
                 const auto& match = matchedPoints[j];
 
-                // Exemple de score: calculer la distance euclidienne entre le point 2D et sa projection prévue
-                // Vous pouvez remplacer cela par une meilleure métrique adaptée à votre problème
                 float score = 0.0f;
                 for (const auto& goodMatch : goodMatches) {
                     if (kpMesh[goodMatch.trainIdx].pt == match.first) {
@@ -797,12 +816,10 @@ bool accumulateMatchesFromModelRotation(
                 scoredMatches.emplace_back(score, match.first, match.second);
             }
 
-          
-
             // Trier les correspondances par score (du meilleur au pire)
             std::sort(scoredMatches.begin(), scoredMatches.end(),
                 [](const auto& a, const auto& b) {
-                    return std::get<0>(a) < std::get<0>(b);  // Tri ascendant car distance plus petite = meilleure
+                    return std::get<0>(a) < std::get<0>(b);
                 });
 
             // Conserver uniquement les meilleures correspondances
@@ -814,41 +831,246 @@ bool accumulateMatchesFromModelRotation(
             }
 
             // Calculer un score global pour cette vue/angle
-            // Par exemple, la moyenne des scores des meilleures correspondances
             float viewScore = 0.0f;
             for (int j = 0; j < numToKeep; ++j) {
                 viewScore += std::get<0>(scoredMatches[j]);
             }
-            
             viewScore /= numToKeep;  // Score moyen
-            if (viewScore > scoredist)
-            {
-                scoredist = viewScore;
-                level = i;
-            }
-                
-            std::cout << "[Angle " << i << "] Correspondances sélectionnées: " << bestMatches.size()
+
+            std::cout << "[Y Angle " << i << "] Correspondances: " << bestMatches.size()
                 << " (score: " << viewScore << ")" << std::endl;
 
-            // Stocker les meilleures correspondances pour cette vue avec leur score global
-            matchesByAngle.emplace_back(viewScore, bestMatches);
+            // Stocker ces résultats
+            rotationResults.emplace_back(viewScore, glm::vec3(0.0f, angleY, 0.0f), bestMatches);
+
+            // Mettre à jour le meilleur angle Y si nécessaire
+            if (viewScore < bestYScore) {
+                bestYScore = viewScore;
+                bestYAngle = angleY;
+            }
         }
     }
 
-    // Trier les vues par score (du meilleur au pire)
-    std::sort(matchesByAngle.begin(), matchesByAngle.end(),
+    // ÉTAPE 2: Rotation secondaire sur les axes X et Z autour du meilleur angle Y
+    std::cout << "\n=== Rotation secondaire autour du meilleur angle Y ("
+        << glm::degrees(bestYAngle) << " degrés) ===" << std::endl;
+
+    // Créer la matrice modèle avec la meilleure rotation Y
+    glm::mat4 bestYModel = glm::rotate(modelBase, bestYAngle, glm::vec3(0, 1, 0));
+
+    // Rotation sur l'axe X
+    for (int i = 0; i < secondaryAngles; ++i) {
+        // Utiliser un intervalle plus petit pour les rotations secondaires
+        float angleX = glm::radians((60.0f / secondaryAngles) * (i - secondaryAngles / 2));
+
+        // Rotation du modèle sur X, après la meilleure rotation sur Y
+        glm::mat4 model = glm::rotate(bestYModel, angleX, glm::vec3(1, 0, 0));
+        glm::vec3 camPos = cameraPos;
+        glm::mat4 view = glm::lookAt(camPos, cameraTarget, glm::vec3(0, 1, 0));
+
+        // Rendu
+        cv::Mat meshImage = renderMeshToImage(vertices, indices, normals, texCoords,
+            shaderProgram, textureID, view, projection, model,
+            imageRef.cols, imageRef.rows);
+
+        std::string inb = "X_" + std::to_string(i);
+        if (meshImage.empty()) continue;
+
+        // Feature matching (même code que pour l'axe Y)
+        cv::Mat grayMesh;
+        cv::cvtColor(meshImage, grayMesh, cv::COLOR_BGR2GRAY);
+        cv::equalizeHist(grayMesh, grayMesh);
+
+        std::vector<cv::KeyPoint> kpMesh;
+        cv::Mat descMesh;
+
+        akaze->detectAndCompute(grayMesh, cv::noArray(), kpMesh, descMesh);
+
+        if (kpRef.empty() || kpMesh.empty() || descRef.empty() || descMesh.empty()) continue;
+
+        cv::BFMatcher matcher(cv::NORM_HAMMING);
+        std::vector<std::vector<cv::DMatch>> knnMatches;
+        matcher.knnMatch(descRef, descMesh, knnMatches, 2);
+
+        std::vector<cv::DMatch> goodMatches;
+        for (auto& m : knnMatches) {
+            if (m.size() >= 2 && m[0].distance < 0.6f * m[1].distance)
+                goodMatches.push_back(m[0]);
+        }
+
+        visualizeMatches(
+            imageRef,
+            meshImage,
+            kpRef,
+            kpMesh,
+            goodMatches,
+            "",
+            "matches_X_" + std::to_string(i) + ".png"
+        );
+
+        glm::mat4 MVP = projection * view * model;
+        auto projectedVerts = projectVerticesToImage(vertices, MVP, imageRef.cols, imageRef.rows);
+        auto matchedPoints = matchKeypointsTo3D(kpMesh, projectedVerts, vertices);
+
+        if (matchedPoints.size() > 0) {
+            std::vector<std::tuple<float, cv::Point2f, glm::vec3>> scoredMatches;
+
+            for (size_t j = 0; j < matchedPoints.size(); ++j) {
+                const auto& match = matchedPoints[j];
+
+                float score = 0.0f;
+                for (const auto& goodMatch : goodMatches) {
+                    if (kpMesh[goodMatch.trainIdx].pt == match.first) {
+                        score = goodMatch.distance;
+                        break;
+                    }
+                }
+
+                scoredMatches.emplace_back(score, match.first, match.second);
+            }
+
+            std::sort(scoredMatches.begin(), scoredMatches.end(),
+                [](const auto& a, const auto& b) {
+                    return std::get<0>(a) < std::get<0>(b);
+                });
+
+            std::vector<std::pair<cv::Point2f, glm::vec3>> bestMatches;
+            int numToKeep = std::min(maxKeypointsPerImage, static_cast<int>(scoredMatches.size()));
+
+            for (int j = 0; j < numToKeep; ++j) {
+                bestMatches.emplace_back(std::get<1>(scoredMatches[j]), std::get<2>(scoredMatches[j]));
+            }
+
+            float viewScore = 0.0f;
+            for (int j = 0; j < numToKeep; ++j) {
+                viewScore += std::get<0>(scoredMatches[j]);
+            }
+            viewScore /= numToKeep;
+
+            std::cout << "[X Angle " << i << "] Correspondances: " << bestMatches.size()
+                << " (score: " << viewScore << ")" << std::endl;
+
+            rotationResults.emplace_back(viewScore, glm::vec3(angleX, bestYAngle, 0.0f), bestMatches);
+        }
+    }
+
+    // Rotation sur l'axe Z
+    for (int i = 0; i < secondaryAngles; ++i) {
+        // Utiliser un intervalle plus petit pour les rotations secondaires
+        float angleZ = glm::radians((60.0f / secondaryAngles) * (i - secondaryAngles / 2));
+
+        // Rotation du modèle sur Z, après la meilleure rotation sur Y
+        glm::mat4 model = glm::rotate(bestYModel, angleZ, glm::vec3(0, 0, 1));
+        glm::vec3 camPos = cameraPos;
+        glm::mat4 view = glm::lookAt(camPos, cameraTarget, glm::vec3(0, 1, 0));
+
+        // Même code que précédemment pour le rendu et le matching
+        cv::Mat meshImage = renderMeshToImage(vertices, indices, normals, texCoords,
+            shaderProgram, textureID, view, projection, model,
+            imageRef.cols, imageRef.rows);
+
+        std::string inb = "Z_" + std::to_string(i);
+        if (meshImage.empty()) continue;
+
+        cv::Mat grayMesh;
+        cv::cvtColor(meshImage, grayMesh, cv::COLOR_BGR2GRAY);
+        cv::equalizeHist(grayMesh, grayMesh);
+
+        std::vector<cv::KeyPoint> kpMesh;
+        cv::Mat descMesh;
+
+        akaze->detectAndCompute(grayMesh, cv::noArray(), kpMesh, descMesh);
+
+        if (kpRef.empty() || kpMesh.empty() || descRef.empty() || descMesh.empty()) continue;
+
+        cv::BFMatcher matcher(cv::NORM_HAMMING);
+        std::vector<std::vector<cv::DMatch>> knnMatches;
+        matcher.knnMatch(descRef, descMesh, knnMatches, 2);
+
+        std::vector<cv::DMatch> goodMatches;
+        for (auto& m : knnMatches) {
+            if (m.size() >= 2 && m[0].distance < 0.6f * m[1].distance)
+                goodMatches.push_back(m[0]);
+        }
+
+        visualizeMatches(
+            imageRef,
+            meshImage,
+            kpRef,
+            kpMesh,
+            goodMatches,
+            "",
+            "matches_Z_" + std::to_string(i) + ".png"
+        );
+
+        glm::mat4 MVP = projection * view * model;
+        auto projectedVerts = projectVerticesToImage(vertices, MVP, imageRef.cols, imageRef.rows);
+        auto matchedPoints = matchKeypointsTo3D(kpMesh, projectedVerts, vertices);
+
+        if (matchedPoints.size() > 0) {
+            std::vector<std::tuple<float, cv::Point2f, glm::vec3>> scoredMatches;
+
+            for (size_t j = 0; j < matchedPoints.size(); ++j) {
+                const auto& match = matchedPoints[j];
+
+                float score = 0.0f;
+                for (const auto& goodMatch : goodMatches) {
+                    if (kpMesh[goodMatch.trainIdx].pt == match.first) {
+                        score = goodMatch.distance;
+                        break;
+                    }
+                }
+
+                scoredMatches.emplace_back(score, match.first, match.second);
+            }
+
+            std::sort(scoredMatches.begin(), scoredMatches.end(),
+                [](const auto& a, const auto& b) {
+                    return std::get<0>(a) < std::get<0>(b);
+                });
+
+            std::vector<std::pair<cv::Point2f, glm::vec3>> bestMatches;
+            int numToKeep = std::min(maxKeypointsPerImage, static_cast<int>(scoredMatches.size()));
+
+            for (int j = 0; j < numToKeep; ++j) {
+                bestMatches.emplace_back(std::get<1>(scoredMatches[j]), std::get<2>(scoredMatches[j]));
+            }
+
+            float viewScore = 0.0f;
+            for (int j = 0; j < numToKeep; ++j) {
+                viewScore += std::get<0>(scoredMatches[j]);
+            }
+            viewScore /= numToKeep;
+
+            std::cout << "[Z Angle " << i << "] Correspondances: " << bestMatches.size()
+                << " (score: " << viewScore << ")" << std::endl;
+
+            rotationResults.emplace_back(viewScore, glm::vec3(0.0f, bestYAngle, angleZ), bestMatches);
+        }
+    }
+
+    // Trier tous les résultats de rotation par score (du meilleur au pire)
+    std::sort(rotationResults.begin(), rotationResults.end(),
         [](const auto& a, const auto& b) {
-            return a.first < b.first;  // Tri ascendant car distance plus petite = meilleure
+            return std::get<0>(a) < std::get<0>(b);  // Plus petit = meilleur
         });
 
     // Ajouter les correspondances à l'ensemble global
-    for (const auto& viewMatches : matchesByAngle) {
-        globalMatches.insert(globalMatches.end(), viewMatches.second.begin(), viewMatches.second.end());
+    for (const auto& result : rotationResults) {
+        const auto& viewMatches = std::get<2>(result);
+        const auto& rotAngles = std::get<1>(result);
+
+        std::cout << "Ajout de " << viewMatches.size() << " correspondances (score: " << std::get<0>(result)
+            << ", angles: X=" << glm::degrees(rotAngles.x)
+            << "°, Y=" << glm::degrees(rotAngles.y)
+            << "°, Z=" << glm::degrees(rotAngles.z) << "°)" << std::endl;
+
+        globalMatches.insert(globalMatches.end(), viewMatches.begin(), viewMatches.end());
     }
 
+    std::cout << "Total des correspondances: " << globalMatches.size() << std::endl;
     return globalMatches.size() >= 4;  // Minimum requis pour PnP
 }
-
 
 
 // Modification de la fonction processInput pour utiliser la vue de caméra actuelle
@@ -877,12 +1099,13 @@ void processInput() {
     if (keys[GLFW_KEY_E]) {
         std::vector<std::pair<cv::Point2f, glm::vec3>> globalMatches;
 
-        if (accumulateMatchesFromModelRotation(
+        if (accumulateMatchesFromMultiAxisRotation(
             "D:/project/PComNorm/shoe1.png", // Image réelle fixe
             vertices, indices, normals, texCoords,
             shaderProgram, textureID,
             projection, Model,
             globalMatches,
+            30,
             30,
             500)) 
         {
