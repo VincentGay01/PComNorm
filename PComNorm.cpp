@@ -28,7 +28,7 @@ bool modelbool = false;
 // Variables globales pour la caméra
 float objectRotationX = 0.0f;
 float objectRotationY = 0.0f;
-float cameraDistance = 1.0f; // Distance de la caméra par rapport à l'objet
+float cameraDistance = 0.5f; // Distance de la caméra par rapport à l'objet
 float cameraAngleX = 0.0f;   // Angle de rotation autour de l'axe X
 float cameraAngleY = 0.0f;   // Angle de rotation autour de l'axe Y
 bool isDragging = false;     // Indique si la souris est en train de glisser
@@ -46,7 +46,7 @@ GLuint overlayShaderProgram;
 GLuint shaderProgram;
 GLuint texCoordVBO;
 GLuint textureID;
-glm::vec3 cameraPos;
+glm::vec3 cameraPos = glm::vec3(0,0,0.5);
 glm::mat4 view;
 glm::mat4 newview;
 float overlayZ = -0.5f; // Distance entre la caméra et le plan d'overlay 
@@ -152,233 +152,6 @@ GLuint createShaderProgram(const char* vertexSource, const char* fragmentSource)
     glDeleteShader(fragmentShader);
 
     return shaderProgram;
-}
-
-
-
-
-
-bool loadPLY(const std::string& filename, std::vector<float>& vertices, std::vector<unsigned int>& indices,
-    std::vector<float>& normals, std::vector<float>& texCoords, std::vector<int>& texNumbers,
-    std::vector<std::string>& textureFiles) {
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "Erreur : Impossible d'ouvrir le fichier " << filename << std::endl;
-        return false;
-    }
-
-    std::string line;
-    bool headerEnded = false;
-    int vertexCount = 0, faceCount = 0;
-    bool hasNormals = false;
-    bool hasTexCoords = false;
-    bool hasTexNumber = false;
-    bool hasTexCoordList = false;
-    bool hasTextureFile = false;
-
-    // Lecture de l'en-tête
-    while (std::getline(file, line)) {
-        if (line == "end_header") {
-            headerEnded = true;
-            break;
-        }
-        std::istringstream iss(line);
-        std::string word;
-        iss >> word;
-        if (word == "element") {
-            std::string type;
-            int count;
-            iss >> type >> count;
-            if (type == "vertex") vertexCount = count;
-            if (type == "face") faceCount = count;
-        }
-        else if (word == "property" && line.find("nx") != std::string::npos) {
-            hasNormals = true;
-        }
-        else if (word == "property" && (line.find("s") != std::string::npos ||
-            line.find("u") != std::string::npos ||
-            line.find("texture_u") != std::string::npos)) {
-            hasTexCoords = true;
-        }
-        else if (word == "property" && line.find("texnumber") != std::string::npos) {
-            hasTexNumber = true;
-        }
-        else if (word == "property" && line.find("list") != std::string::npos && line.find("texcoord") != std::string::npos) {
-            hasTexCoordList = true;
-        }
-        else if (word == "comment" && line.find("TextureFile") != std::string::npos) {
-            // Extraction du nom du fichier de texture depuis le commentaire
-            size_t pos = line.find("TextureFile");
-            if (pos != std::string::npos) {
-                std::string texturePath = line.substr(pos + 11); // 11 est la longueur de "TextureFile"
-                // Supprimer les espaces en début et fin
-                texturePath.erase(0, texturePath.find_first_not_of(" \t"));
-                texturePath.erase(texturePath.find_last_not_of(" \t") + 1);
-                textureFiles.push_back(texturePath);
-                hasTextureFile = true;
-            }
-        }
-    }
-
-    if (!headerEnded) {
-        std::cerr << "Erreur : En-tête du fichier .ply incorrect" << std::endl;
-        return false;
-    }
-
-    // Variables temporaires pour stocker les positions
-    std::vector<glm::vec3> positions;
-
-    // Lecture des sommets
-    for (int i = 0; i < vertexCount; ++i) {
-        std::getline(file, line);
-        std::istringstream iss(line);
-        float x, y, z;
-        iss >> x >> y >> z;
-
-        // Stocker la position pour le calcul des normales si nécessaire
-        positions.push_back(glm::vec3(x, y, z));
-
-        // Ajouter la position aux vertices
-        vertices.push_back(x);
-        vertices.push_back(y);
-        vertices.push_back(z);
-
-        if (hasNormals) {
-            // Si le fichier contient des normales, les lire
-            float nx, ny, nz;
-            iss >> nx >> ny >> nz;
-            normals.push_back(nx);
-            normals.push_back(ny);
-            normals.push_back(nz);
-        }
-
-        if (hasTexCoords && !hasTexCoordList) {
-            // Si le fichier contient des coordonnées de texture standard, les lire
-            float u, v;
-            iss >> u >> v;
-            texCoords.push_back(u);
-            texCoords.push_back(v);
-        }
-
-        if (hasTexNumber) {
-            // Si le fichier contient un numéro de texture, le lire
-            int texNum;
-            iss >> texNum;
-            texNumbers.push_back(texNum);
-        }
-    }
-
-    // Stocker les triangles pour calculer les normales si nécessaire
-    std::vector<glm::uvec3> triangles;
-
-    // Lecture des faces
-    for (int i = 0; i < faceCount; ++i) {
-        std::getline(file, line);
-        std::istringstream iss(line);
-
-        if (hasTexCoordList) {
-            // Format: nombre_vertices v1 v2 v3 nombre_coords_tex tx1 ty1 tx2 ty2 tx3 ty3
-            int vertexCount, v1, v2, v3;
-            iss >> vertexCount >> v1 >> v2 >> v3;
-
-            if (vertexCount == 3) { // On ne gère que les triangles
-                indices.push_back(v1);
-                indices.push_back(v2);
-                indices.push_back(v3);
-
-                // Stocker le triangle pour le calcul des normales
-                triangles.push_back(glm::uvec3(v1, v2, v3));
-
-                // Lire le nombre de coordonnées de texture
-                unsigned char numTexCoords;
-                iss >> numTexCoords;
-
-                // Lire les coordonnées de texture pour chaque sommet du triangle
-                for (int j = 0; j < numTexCoords && j < vertexCount * 2; j += 2) {
-                    float u, v;
-                    iss >> u >> v;
-
-                    // Assurez-vous que texCoords a suffisamment d'espace
-                    while (texCoords.size() <= v1 * 2 + j + 1) {
-                        texCoords.push_back(0.0f);
-                        texCoords.push_back(0.0f);
-                    }
-
-                    // Stocker les coordonnées de texture
-                    if (j == 0) {
-                        texCoords[v1 * 2] = u;
-                        texCoords[v1 * 2 + 1] = v;
-                    }
-                    else if (j == 2) {
-                        texCoords[v2 * 2] = u;
-                        texCoords[v2 * 2 + 1] = v;
-                    }
-                    else if (j == 4) {
-                        texCoords[v3 * 2] = u;
-                        texCoords[v3 * 2 + 1] = v;
-                    }
-                }
-            }
-        }
-        else {
-            // Format standard: nombre_vertices v1 v2 v3
-            int vertexCount, v1, v2, v3;
-            iss >> vertexCount >> v1 >> v2 >> v3;
-
-            if (vertexCount == 3) { // On ne gère que les triangles
-                indices.push_back(v1);
-                indices.push_back(v2);
-                indices.push_back(v3);
-
-                // Stocker le triangle pour le calcul des normales
-                triangles.push_back(glm::uvec3(v1, v2, v3));
-            }
-        }
-    }
-
-    // Si le fichier ne contient pas de normales, les calculer
-    if (!hasNormals) {
-        // Initialiser les normales à zéro
-        normals.resize(positions.size() * 3, 0.0f);
-
-        // Calculer les normales pour chaque triangle
-        for (const auto& triangle : triangles) {
-            glm::vec3 v0 = positions[triangle[0]];
-            glm::vec3 v1 = positions[triangle[1]];
-            glm::vec3 v2 = positions[triangle[2]];
-
-            // Calculer les vecteurs des côtés du triangle
-            glm::vec3 edge1 = v1 - v0;
-            glm::vec3 edge2 = v2 - v0;
-
-            // Calculer la normale du triangle par produit vectoriel
-            glm::vec3 normal = glm::normalize(glm::cross(edge1, edge2));
-
-            // Ajouter cette normale aux trois sommets du triangle
-            for (int j = 0; j < 3; ++j) {
-                int idx = triangle[j] * 3;
-                normals[idx] += normal.x;
-                normals[idx + 1] += normal.y;
-                normals[idx + 2] += normal.z;
-            }
-        }
-
-        // Normaliser toutes les normales
-        for (size_t i = 0; i < normals.size(); i += 3) {
-            glm::vec3 n(normals[i], normals[i + 1], normals[i + 2]);
-            n = glm::normalize(n);
-            normals[i] = n.x;
-            normals[i + 1] = n.y;
-            normals[i + 2] = n.z;
-        }
-    }
-
-    // Si le fichier ne contient pas de coordonnées de texture, initialiser avec des valeurs par défaut
-    if (!hasTexCoords && !hasTexCoordList) {
-        texCoords.resize(positions.size() * 2, 0.0f);
-    }
-
-    return true;
 }
 
 
@@ -852,65 +625,6 @@ cv::Mat renderMeshToImage(const std::vector<float>& vertices,
 
 
 
-void alignByContoursRANSAC(const cv::Mat& img1, const cv::Mat& img2) {
-    // 1. Détection de bords (Canny)
-    cv::Mat edges1, edges2;
-    cv::Canny(img1, edges1, 100, 200);
-    cv::Canny(img2, edges2, 100, 200);
-
-    // 2. Trouver les contours
-    std::vector<std::vector<cv::Point>> contours1, contours2;
-    cv::findContours(edges1, contours1, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-    cv::findContours(edges2, contours2, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-
-    // 3. Fusionner tous les points de contours en un seul nuage de points
-    std::vector<cv::Point> points1, points2;
-    for (auto& contour : contours1) points1.insert(points1.end(), contour.begin(), contour.end());
-    for (auto& contour : contours2) points2.insert(points2.end(), contour.begin(), contour.end());
-
-    // 4. Downsampling (on prend 1 point sur N pour accélérer)
-    const int sampleRate = 10;
-    std::vector<cv::Point2f> sampled1, sampled2;
-    for (size_t i = 0; i < points1.size(); i += sampleRate) sampled1.push_back(points1[i]);
-    for (size_t i = 0; i < points2.size(); i += sampleRate) sampled2.push_back(points2[i]);
-
-    // 5. Matching naïf basé sur la distance (greedy matching)
-    std::vector<cv::Point2f> matched1, matched2;
-    for (auto& p1 : sampled1) {
-        double minDist = 1e9;
-        cv::Point2f bestMatch;
-        for (auto& p2 : sampled2) {
-            double dist = cv::norm(p1 - p2);
-            if (dist < minDist) {
-                minDist = dist;
-                bestMatch = p2;
-            }
-        }
-        matched1.push_back(p1);
-        matched2.push_back(bestMatch);
-    }
-
-    // 6. Estimer la transformation avec RANSAC
-    cv::Mat inlierMask;
-    cv::Mat affine = cv::estimateAffinePartial2D(matched1, matched2, inlierMask, cv::RANSAC);
-
-    if (affine.empty()) {
-        std::cerr << "Erreur : pas de transformation trouvée !" << std::endl;
-        return;
-    }
-
-    // 7. Appliquer la transformation
-    cv::Mat aligned;
-    cv::warpAffine(img1, aligned, affine, img2.size());
-
-    // 8. Afficher les résultats
-    cv::imwrite("Image 1 (Originale)", img1);
-    cv::imwrite("Image 2 (Reference)", img2);
-    cv::imwrite("Image 1 alignée", aligned);
-
-    cv::waitKey(0);
-}
-
 // Fonction modifiée pour prendre en compte les matrices de vue et de projection actuelles
 bool alignMeshWithImage(const char* imagePath,
     const std::vector<float>& vertices,
@@ -934,24 +648,35 @@ bool alignMeshWithImage(const char* imagePath,
         shaderProgram,textureID ,view, projection, model,
         referenceImage.cols, referenceImage.rows);
 
-	
-    // Optionnel: Sauvegarder les images pour débogage
-    cv::imwrite("reference_image.png", referenceImage);
-    cv::imwrite("mesh_rendering.png", meshRendering);
+    cv::Mat gray1, gray2;
 
-    // 3. Détecter des points caractéristiques dans les deux images
-    cv::Ptr<cv::Feature2D> detector = cv::SIFT::create(
-        20000,        // Nombre de keypoints maximum (par image)
-        5,    // Nombre de couches par octave
-        0.09,// Seuil de contraste (rejette points peu significatifs)
-        20,    // Seuil pour éliminer les points près des bords
-        1.2             // Écart-type du flou gaussien appliqué en entrée
+    cv::cvtColor(referenceImage, gray1, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(meshRendering, gray2, cv::COLOR_BGR2GRAY);
+	
+    // Égalisation d'histogramme pour améliorer le contraste
+    cv::equalizeHist(gray1, gray1);
+    cv::equalizeHist(gray2, gray2);
+
+
+    // Optionnel: Sauvegarder les images pour débogage
+    cv::imwrite("reference_image.png",gray1);
+    cv::imwrite("mesh_rendering.png", gray2);
+
+    // Utiliser des paramètres AKAZE plus sûrs
+    cv::Ptr<cv::AKAZE> akaze = cv::AKAZE::create(
+        cv::AKAZE::DESCRIPTOR_MLDB,
+        128,                  // Taille par défaut
+        3,                  // Canaux
+        0.001f,            // Seuil plus bas
+        4,                  // Octaves
+        4,                  // Couches par octave
+        cv::KAZE::DIFF_PM_G2
     );
     std::vector<cv::KeyPoint> keypointsRef, keypointsMesh;
     cv::Mat descriptorsRef, descriptorsMesh;
-    
-    detector->detectAndCompute(referenceImage, cv::noArray(), keypointsRef, descriptorsRef);
-    detector->detectAndCompute(meshRendering, cv::noArray(), keypointsMesh, descriptorsMesh);
+  
+    akaze->detectAndCompute(gray1, cv::noArray(), keypointsRef, descriptorsRef);
+    akaze->detectAndCompute(gray2, cv::noArray(), keypointsMesh, descriptorsMesh);
 
     // Vérifier si des points caractéristiques ont été trouvés
     if (keypointsRef.empty() || keypointsMesh.empty()) {
@@ -968,28 +693,16 @@ bool alignMeshWithImage(const char* imagePath,
         << " dans l'image de référence, " << keypointsMesh.size()
         << " dans le rendu du maillage." << std::endl;
 
+
     // 4. Matcher les points caractéristiques
-    cv::Ptr<cv::DescriptorMatcher> matcher = cv::DescriptorMatcher::create(cv::DescriptorMatcher::FLANNBASED);
+    cv::BFMatcher matcher(cv::NORM_HAMMING);
     std::vector<std::vector<cv::DMatch>> knnMatches;
+    matcher.knnMatch(descriptorsRef, descriptorsMesh, knnMatches, 2);
 
-    // Vérifier si les descripteurs sont du bon type pour FLANN
-    if (descriptorsRef.type() != CV_32F) {
-        descriptorsRef.convertTo(descriptorsRef, CV_32F);
-    }
-    if (descriptorsMesh.type() != CV_32F) {
-        descriptorsMesh.convertTo(descriptorsMesh, CV_32F);
-    }
 
-    try {
-        matcher->knnMatch(descriptorsRef, descriptorsMesh, knnMatches, 2);
-    }
-    catch (const cv::Exception& e) {
-        std::cerr << "Erreur lors du matching: " << e.what() << std::endl;
-        return false;
-    }
 
     // 5. Filtrer les correspondances de bonne qualité
-    const float ratioThresh = 0.7f;
+    const float ratioThresh = 0.5f;
     std::vector<cv::DMatch> goodMatches;
     for (size_t i = 0; i < knnMatches.size(); i++) {
         if (knnMatches[i].size() < 2) continue; // Ignorer les matchs incomplets
@@ -998,6 +711,13 @@ bool alignMeshWithImage(const char* imagePath,
             goodMatches.push_back(knnMatches[i][0]);
         }
     }
+
+    cv::Mat debugimage2 = referenceImage.clone();
+    for (const auto& m : keypointsRef) {
+        cv::circle(debugimage2, m.pt, 4, cv::Scalar(0, 255, 0), -1);
+    }
+    cv::imwrite("debug_matched_points2.png", debugimage2);
+
 
     // 6. Filtrer pour garantir une correspondance unique
        // Pour chaque keypoint, ne conserver que la meilleure correspondance
@@ -1059,6 +779,9 @@ bool alignMeshWithImage(const char* imagePath,
         cv::circle(debugImage, m.first, 4, cv::Scalar(0, 255, 0), -1);
     }
     cv::imwrite("debug_matched_points.png", debugImage);
+
+	
+
     for (const auto& match : matchedPoints) {
         const cv::Point2f& keypoint2D = match.first;
         const glm::vec3& point3D = match.second;
@@ -1107,6 +830,100 @@ bool alignMeshWithImage(const char* imagePath,
 }
 
 
+bool accumulateMatchesFromModelRotation(
+    const std::string& refImagePath,
+    const std::vector<float>& vertices,
+    const std::vector<unsigned int>& indices,
+    const std::vector<float>& normals,
+    const std::vector<float>& texCoords,
+    GLuint shaderProgram,
+    GLuint textureID,
+    const glm::mat4& projection,
+    glm::mat4& modelBase,
+    std::vector<std::pair<cv::Point2f, glm::vec3>>& globalMatches,
+    int nbAngles = 10)
+{
+    cv::Ptr<cv::AKAZE> akaze = cv::AKAZE::create(
+        cv::AKAZE::DESCRIPTOR_MLDB,
+        128,                  // Taille par défaut
+        3,                  // Canaux
+        0.005f,            // Seuil plus bas
+        5,                  // Octaves
+        4,                  // Couches par octave
+        cv::KAZE::DIFF_PM_G2
+    );
+
+    cv::Mat grayRef;
+    std::vector<cv::KeyPoint> kpRef;
+    cv::Mat descRef;
+    cv::Mat imageRef = cv::imread(refImagePath, cv::IMREAD_COLOR);
+    if (imageRef.empty()) {
+        std::cerr << "Erreur chargement image " << refImagePath << std::endl;
+        return false;
+    }
+    cv::cvtColor(imageRef, grayRef, cv::COLOR_BGR2GRAY);
+    akaze->detectAndCompute(grayRef, cv::noArray(), kpRef, descRef);
+
+    for (int i = 0; i < nbAngles; ++i) {
+        float angleY = glm::radians((360.0f / nbAngles) * i);
+
+        // Rotation du modèle
+        glm::mat4 model = glm::rotate(modelBase, angleY, glm::vec3(0, 1, 0));
+        glm::vec3 camPos =cameraPos;
+        glm::mat4 view = glm::lookAt(camPos,cameraTarget, glm::vec3(0, 1, 0));
+
+        // Rendu
+        cv::Mat meshImage = renderMeshToImage(vertices, indices, normals, texCoords,
+            shaderProgram, textureID, view, projection, model,
+            imageRef.cols, imageRef.rows);
+
+		std::string inb = std::to_string(i);
+        if (meshImage.empty()) continue;
+
+        // Feature matching
+        cv::Mat grayMesh;
+        cv::cvtColor(imageRef, grayRef, cv::COLOR_BGR2GRAY);
+        cv::cvtColor(meshImage, grayMesh, cv::COLOR_BGR2GRAY);
+        cv::equalizeHist(grayRef, grayRef);
+        cv::equalizeHist(grayMesh, grayMesh);
+
+       
+        std::vector<cv::KeyPoint>  kpMesh;
+        cv::Mat  descMesh;
+        
+        akaze->detectAndCompute(grayMesh, cv::noArray(), kpMesh, descMesh);
+
+
+      
+
+        if (kpRef.empty() || kpMesh.empty() || descRef.empty() || descMesh.empty()) continue;
+
+        cv::BFMatcher matcher(cv::NORM_HAMMING);
+        std::vector<std::vector<cv::DMatch>> knnMatches;
+        matcher.knnMatch(descRef, descMesh, knnMatches, 2);
+
+        std::vector<cv::DMatch> goodMatches;
+        for (auto& m : knnMatches) {
+            if (m.size() >= 2 && m[0].distance < 0.6f * m[1].distance)
+                goodMatches.push_back(m[0]);
+        }
+
+        cv::Mat debugImage = meshImage.clone();
+        for (const auto& m : kpMesh) {
+            cv::circle(debugImage, m.pt, 4, cv::Scalar(0, 255, 0), -1);
+        }
+        cv::imwrite("meshImage" + inb + ".png", debugImage);
+        glm::mat4 MVP = projection * view * model;
+        auto projectedVerts = projectVerticesToImage(vertices, MVP, imageRef.cols, imageRef.rows);
+        auto matchedPoints = matchKeypointsTo3D(kpMesh, projectedVerts, vertices);
+
+        std::cout << "[Angle " << i << "] correspondances valides : " << matchedPoints.size() << std::endl;
+
+        globalMatches.insert(globalMatches.end(), matchedPoints.begin(), matchedPoints.end());
+    }
+
+    return globalMatches.size() >= 4;
+}
 
 
 
@@ -1132,20 +949,31 @@ void processInput() {
         if (keys[GLFW_KEY_LEFT_CONTROL] || keys[GLFW_KEY_RIGHT_CONTROL])
             cameraTarget -= worldUp * cameraSpeed;
     }
+
     if (keys[GLFW_KEY_E]) {
-        
-        bool alignmentSuccess = alignMeshWithImage(
-            "D:/project/PComNorm/shoe1.png", // Chemin de l'image de référence
-            vertices,                            // Vos vertices
-            indices,                             // Vos indices
-            normals,                             // Vos normales
-            shaderProgram,                       // Votre programme de shader
-            view,                                // Vue actuelle de la caméra
-            projection,                          // Projection actuelle
-            Model,                               // Matrice modèle actuelle
-            alignmentMatrix                      // Matrice de sortie
-        );
+        std::vector<std::pair<cv::Point2f, glm::vec3>> globalMatches;
+
+        if (accumulateMatchesFromModelRotation(
+            "D:/project/PComNorm/shoe1.png", // Image réelle fixe
+            vertices, indices, normals, texCoords,
+            shaderProgram, textureID,
+            projection, Model,
+            globalMatches,
+            20)) // 12 angles (tous les 30°)
+        {
+            cv::Mat cameraMatrix = (cv::Mat_<double>(3, 3) <<
+                2252.308217738484, 0, 1352.0,
+                0, 2252.308217738484, 900.0,
+                0, 0, 1);
+
+            poseFound = estimateCameraPoseFromMatches(globalMatches, cameraMatrix, rvec, tvec);
+            if (poseFound) {
+                newview = createViewMatrixFromPnP(rvec, tvec);
+                std::cout << "Pose multivue (rotation modèle) trouvée " << std::endl;
+            }
+        }
     }
+
 
     // Déplacement haut/bas sur l'axe Y
     if (keys[GLFW_KEY_SPACE])
@@ -1202,12 +1030,8 @@ int main() {
 
     // Activer le test de profondeur
     glEnable(GL_DEPTH_TEST);
-    /*
-    if (!loadPLY("D:/project/PComNorm/Chemi-AU-O0051.ply", vertices, indices, normals, texCoords, texNumbers, textureFiles)) {
-        return -1;
-    }
-    */
-    if (!loadPLY_clean("D:/project/PComNorm/Chemi-AU-O0052.ply", vertices, indices, normals, texCoords, textureFiles)) {
+    
+    if (!loadPLY_clean("D:/project/PComNorm/Chemi-AU-O0051.ply", vertices, indices, normals, texCoords, textureFiles)) {
         return -1;
     }
 
@@ -1369,24 +1193,33 @@ int main() {
         if (succ == false) 
         {
             if (poseFound == false) {
+                
                 cameraPos = glm::vec3(
                     cameraDistance * sin(glm::radians(cameraAngleY)) * cos(glm::radians(cameraAngleX)),
                     cameraDistance * sin(glm::radians(cameraAngleX)),
                     cameraDistance * cos(glm::radians(cameraAngleY)) * cos(glm::radians(cameraAngleX))
                 );
-
+                
                 cameraPos += cameraTarget;
-
+                
+               // cameraPos = glm::vec3(-0.264969, 0.130404, 0.376127);
+                view = glm::lookAt(cameraPos, cameraTarget, glm::vec3(0.0f, 1.0f, 0.0f));
             }
             else {
-                cameraPos = newview * glm::vec4(cameraPos, 1);
+				// Utiliser la matrice de vue calculée par PnP
+				//cameraPos = glm::vec3(tvec.at<double>(0), tvec.at<double>(1), tvec.at<double>(2));
+			
+                view = newview;//glm::lookAt(cameraPos, cameraTarget, glm::vec3(0.0f, 1.0f, 0.0f));
 				succ = true;
+                glm::mat4 test  =glm::mat4( transpose(newview));
+                printf("cameraPos: %f %f %f\n", test );
             }
+			
         }
-        view = glm::lookAt(cameraPos, cameraTarget, glm::vec3(0.0f, 1.0f, 0.0f));
         
         
-        if (modelbool==false)
+        
+        if (succ==false)
         {
             // Matrice Model pour l'objet 3D
             Model = glm::mat4(1.0f);
@@ -1394,7 +1227,7 @@ int main() {
             Model = rotate(Model, glm::radians(objectRotationX), glm::vec3(1, 0, 0));
             Model = rotate(Model, glm::radians(objectRotationY), glm::vec3(0, 1, 0));
             Model = scale(Model, glm::vec3(.8, .8, .8));
-           
+            
         }
 
         MVP = projection * view * Model;
